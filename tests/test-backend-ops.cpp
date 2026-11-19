@@ -11880,6 +11880,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_prec_src1_f32(type_a,  64,  32, 256, {2, 3}, {2, 1}));
     }
 
+    for (int64_t m : {4, 8}) {
+        for (int64_t n : {1, 4, 8, 16, 32, 512}) {
+            test_cases.emplace_back(new test_mul_mat_prec_src1_f32(GGML_TYPE_F32, m, n, 8192));
+        }
+    }
+
     // src0 range: an F32 src0 must not be downcast to F16 when src1 requests BF16
     test_cases.emplace_back(new test_mul_mat_prec_src1_bf16_src0(GGML_TYPE_F32,  64,   1, 256));
     test_cases.emplace_back(new test_mul_mat_prec_src1_bf16_src0(GGML_TYPE_F32,  64,   8, 256));

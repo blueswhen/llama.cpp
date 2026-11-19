@@ -1510,11 +1510,29 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
     }
 }
 
+static bool ggml_metal_mul_mat_is_aligned_f32(const struct ggml_tensor * tensor) {
+    uintptr_t address = (uintptr_t) tensor->data;
+    if (tensor->data == NULL) {
+        address = tensor->view_offs;
+        if (tensor->view_src != NULL) {
+            address += (uintptr_t) tensor->view_src->data;
+        }
+    }
+    return tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor) && address % (4*sizeof(float)) == 0;
+}
+
 static bool ggml_metal_supports_mul_mat_src1_prec(const struct ggml_tensor * op, bool has_tensor) {
     const enum ggml_prec prec = ggml_prec_get_src(op, 1);
 
     if (prec == GGML_PREC_F32) {
-        return false;
+        const struct ggml_tensor * src0 = op->src[0];
+        const struct ggml_tensor * src1 = op->src[1];
+        // Leave room for rounding up the signed 32-bit dispatch dimensions.
+        const int64_t max_dim = INT32_MAX - 127;
+        return op->op == GGML_OP_MUL_MAT && op->type == GGML_TYPE_F32 &&
+            src0->ne[0] <= max_dim && src0->ne[1] <= max_dim && src1->ne[1] <= max_dim &&
+            src1->ne[2] <= INT16_MAX && src1->ne[3] <= INT16_MAX &&
+            ggml_metal_mul_mat_is_aligned_f32(src0) && ggml_metal_mul_mat_is_aligned_f32(src1);
     }
     if (prec == GGML_PREC_BF16) {
         return has_tensor && op->op == GGML_OP_MUL_MAT && op->src[0]->type != GGML_TYPE_F32;

@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #include "ggml-metal-common.h"
 #include "ggml-metal-device.h"
@@ -166,13 +167,14 @@ static int run_row_independent_pack_cases() {
 
 // true if the encoder's check fuses a few-row MUL_MAT with a same-shape residual, which is a weight if weight_res;
 // the check compares Metal buffer ranges, so the tensors live in Metal buffers
-static bool encoder_fuses_mul_mat_add(bool weight_res) {
+static bool encoder_fuses_mul_mat_add(bool weight_res, ggml_prec src1_prec = GGML_PREC_UNDEFINED) {
     ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU));
     ggml_init_params params = { n_tensors*ggml_tensor_overhead(), nullptr, true };
     ggml_context * ctx   = ggml_init(params);
     ggml_context * ctx_w = ggml_init(params);
     ggml_tensor * x   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_k, n_rows);
     ggml_tensor * mm  = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n_k, n_m), x);
+    ggml_prec_set_src(mm, src1_prec, 1);
     ggml_tensor * add = ggml_add(ctx, mm, ggml_new_tensor_2d(weight_res ? ctx_w : ctx, GGML_TYPE_F32, n_m, n_rows));
     ggml_backend_buffer_t buffer  = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
     ggml_backend_buffer_t weights = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, buft);
@@ -196,19 +198,55 @@ static bool encoder_fuses_mul_mat_add(bool weight_res) {
     return fused;
 }
 
-// the encoder may fuse only what the reorder packs, so it must leave a same-shape residual alone when it is a weight
-static bool check_encoder_skips_weight_residual() {
+static bool check_encoder_mul_mat_add() {
     const bool fuses_residual = encoder_fuses_mul_mat_add(false);
     const bool fuses_weight   = encoder_fuses_mul_mat_add(true);
-    const bool ok = fuses_residual && !fuses_weight;
-    std::printf("encoder fuses MUL_MAT+ADD of a residual %d (expected 1), of a weight %d (expected 0): %s\n",
-        fuses_residual, fuses_weight, ok ? "OK" : "FAIL");
+    const bool fuses_f32      = encoder_fuses_mul_mat_add(false, GGML_PREC_F32);
+    const bool ok = fuses_residual && !fuses_weight && fuses_f32;
+    std::printf("encoder fuses MUL_MAT+ADD of a residual %d (expected 1), of a weight %d (expected 0), with F32 precision %d (expected 1): %s\n",
+        fuses_residual, fuses_weight, fuses_f32, ok ? "OK" : "FAIL");
     return ok;
 }
 
 static ggml_context * graph_ctx() {
     ggml_init_params params = { n_tensors*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
     return ggml_init(params);
+}
+
+static bool check_f32_mul_mat_support() {
+    ggml_backend_dev_t dev = ggml_backend_dev_by_name("MTL0");
+    GGML_ASSERT(dev != nullptr);
+    const auto * props = ggml_metal_device_get_props((ggml_metal_device_t) dev->context);
+    if (!props->has_simdgroup_reduction) {
+        std::printf("F32 mat-mul support test skipped without SIMD-group reduction\n");
+        return true;
+    }
+
+    ggml_context * ctx = graph_ctx();
+    ggml_tensor * src0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8192, 8);
+    ggml_tensor * src1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8192, 8);
+    ggml_tensor * mm = ggml_mul_mat(ctx, src0, src1);
+    ggml_prec_set_src(mm, GGML_PREC_F32, 1);
+    const bool supports_router = ggml_backend_dev_supports_op(dev, mm);
+
+    alignas(16) float data[32*8 + 1] = {};
+    ggml_tensor * unaligned = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 8);
+    unaligned->data = data + 1;
+    ggml_tensor * unaligned_mm = ggml_mul_mat(ctx, unaligned, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 8));
+    ggml_prec_set_src(unaligned_mm, GGML_PREC_F32, 1);
+    const bool rejects_unaligned = !ggml_backend_dev_supports_op(dev, unaligned_mm);
+
+    ggml_tensor * wide0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, INT32_MAX, 1);
+    ggml_tensor * wide1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, INT32_MAX, 1);
+    ggml_tensor * wide_mm = ggml_mul_mat(ctx, wide0, wide1);
+    ggml_prec_set_src(wide_mm, GGML_PREC_F32, 1);
+    const bool rejects_wide = !ggml_backend_dev_supports_op(dev, wide_mm);
+
+    ggml_free(ctx);
+    const bool ok = supports_router && rejects_unaligned && rejects_wide;
+    std::printf("F32 router supported %d, unaligned input rejected %d, wide input rejected %d: %s\n",
+        supports_router, rejects_unaligned, rejects_wide, ok ? "OK" : "FAIL");
+    return ok;
 }
 
 static void expand_all(ggml_cgraph * graph, const std::vector<ggml_tensor *> & outputs) {
@@ -279,7 +317,7 @@ int main() {
         { "probed or no simdgroup matrices", false, true },
     };
     const int failures = run_pack_cases(devices) + (check_chained_pack_reader() ? 0 : 1) + run_row_independent_pack_cases() +
-        (check_encoder_skips_weight_residual() ? 0 : 1);
+        (check_encoder_mul_mat_add() ? 0 : 1) + (check_f32_mul_mat_support() ? 0 : 1);
 
     return failures == 0 ? 0 : 1;
 }
