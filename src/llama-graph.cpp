@@ -4164,8 +4164,16 @@ ggml_tensor * llm_graph_context::build_rs(
         ggml_tensor * s,
             int32_t   state_size,
             int32_t   n_seqs,
-        const llm_graph_get_rows_fn & get_state_rows) const {
+        const llm_graph_get_rows_fn & get_state_rows,
+        bool prefer_direct) const {
     const auto * kv_state = inp->mctx;
+
+    // With one live slot and no clear or rollback, the F32 state is already in place.
+    if (prefer_direct && !get_state_rows && n_seqs == 1 &&
+            kv_state->get_size() == 1 && kv_state->get_n_rs() == 1 && kv_state->get_head() == 0 &&
+            kv_state->get_rs_z() < 0 && s->type == GGML_TYPE_F32 && s->ne[0] == state_size && s->ne[1] == 1) {
+        return s;
+    }
 
     // a custom getter reads the states of the ubatch straight from the cache, so the gather skips the first
     // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch

@@ -11299,6 +11299,88 @@ void ggml_compute_forward_gated_delta_net(
 }
 
 
+static float ggml_hc_softplus(float x) {
+    return std::max(x, 0.0f) + log1pf(expf(-fabsf(x)));
+}
+
+static void ggml_hc_log_normalize(float & a, float & b) {
+    const float diff = a - b;
+    a = -ggml_hc_softplus(-diff);
+    b = -ggml_hc_softplus(diff);
+}
+
+static float ggml_hc_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+void ggml_compute_forward_hc_route_2(const ggml_compute_params * params, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_hc_route_2_valid(dst));
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * weight = dst->src[1];
+    const float * bias = (const float *) dst->src[2]->data;
+    const float * norm = (const float *) dst->src[3]->data;
+    const float norm_eps = ggml_get_op_params_f32(dst, 2);
+    const int64_t d = x->ne[0];
+    const int64_t n_logits = weight->ne[1];
+    const int n_iter = ggml_get_op_params_i32(dst, 1);
+    const float pre_scale = ggml_get_op_params_f32(dst, 0);
+
+    for (int64_t it = params->ith; it < x->ne[2]; it += params->nth) {
+        const float * a = (const float *) ((const char *) x->data + it*x->nb[2]);
+        const float * b = (const float *) ((const char *) a + x->nb[1]);
+        float * out = (float *) ((char *) dst->data + it*dst->nb[1]);
+
+        float sum = 0.0f;
+        for (int64_t i = 0; i < d; ++i) {
+            sum += a[i]*a[i] + b[i]*b[i];
+        }
+        const float rms = 1.0f / sqrtf(sum / (2*d) + 1e-6f);
+        float logits[8] = {};
+        for (int64_t j = 0; j < n_logits; ++j) {
+            const float * w = (const float *) ((const char *) weight->data + j*weight->nb[1]);
+            float dot = 0.0f;
+            for (int64_t i = 0; i < d; ++i) {
+                dot += (a[i]*rms)*w[i] + (b[i]*rms)*w[d + i];
+            }
+            logits[j] = dot + bias[j];
+        }
+
+        const float pre_a = ggml_hc_sigmoid(logits[0]);
+        const float pre_b = ggml_hc_sigmoid(logits[1]);
+        float branch_sum = 0.0f;
+        for (int64_t i = 0; i < d; ++i) {
+            out[i] = pre_scale*(pre_a*a[i] + pre_b*b[i]);
+            branch_sum += out[i]*out[i];
+        }
+        const float branch_rms = 1.0f / sqrtf(branch_sum/d + norm_eps);
+        for (int64_t i = 0; i < d; ++i) {
+            out[i] = (out[i]*branch_rms)*norm[i];
+        }
+
+        out[d]     = 2.0f*ggml_hc_sigmoid(logits[2]);
+        out[d + 1] = 2.0f*ggml_hc_sigmoid(logits[3]);
+        float a00 = 0.0f, a01 = -INFINITY, a10 = -INFINITY, a11 = 0.0f;
+        if (n_logits == 8) {
+            a00 = logits[4];
+            a01 = logits[5];
+            a10 = logits[6];
+            a11 = logits[7];
+            for (int i = 0; i < n_iter; ++i) {
+                ggml_hc_log_normalize(a00, a01);
+                ggml_hc_log_normalize(a10, a11);
+                ggml_hc_log_normalize(a00, a10);
+                ggml_hc_log_normalize(a01, a11);
+            }
+        }
+        out[d + 2] = expf(a00);
+        out[d + 3] = expf(a10);
+        out[d + 4] = expf(a01);
+        out[d + 5] = expf(a11);
+        out[d + 6] = 0.0f;
+        out[d + 7] = 0.0f;
+    }
+}
+
 // ggml_compute_forward_dsv4_hc_comb
 
 static void ggml_dsv4_hc_comb_norm_cols(float * comb, float eps) {

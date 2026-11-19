@@ -428,6 +428,7 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+        GGML_OP_HC_ROUTE_2,
 
         GGML_OP_COUNT,
     };
@@ -2497,6 +2498,21 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // Two-stream hyper-connection routing. Returns [normalized branch | post | mix | padding] per token.
+    // x: [n_embd, 2, n_tokens], weight: [2*n_embd, 4 or 8], bias: [4 or 8].
+    // norm: [n_embd], applied after the pre-gated stream sum.
+    // Four logits select identity mixing. Eight logits use 1-20 Sinkhorn steps.
+    // Mix is stored as [dst, src] for ggml_dsv4_hc_post.
+    GGML_API struct ggml_tensor * ggml_hc_route_2(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * norm,
+            float                 norm_eps,
+            float                 pre_scale,
+            int32_t               n_iter);
 
     // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
     //

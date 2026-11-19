@@ -2768,6 +2768,9 @@ struct llama_model_sensenova_loop : public llama_model_qwen35 {
             ggml_tensor * mix;
         };
 
+        bool use_fused_mhc() const;
+        ggml_tensor * build_fused_mhc(ggml_tensor * streams, int il,
+                bool attn, llm_graph_input_mem_hybrid * memory, ggml_tensor * pos);
         routing build_route(ggml_tensor * residual, ggml_tensor * weight, ggml_tensor * bias, int il);
         static void build_sinkhorn(ggml_context * ctx, ggml_tensor * mix[4], uint32_t iterations) {
             ggml_tensor * d0 = ggml_sub(ctx, mix[0], mix[1]);

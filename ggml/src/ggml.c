@@ -1112,9 +1112,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "HC_ROUTE_2",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1225,9 +1226,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "hc_route_2(x, weight, bias, norm)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6542,6 +6544,32 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[2] = post;
     result->src[3] = comb;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_hc_route_2(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * bias,
+        struct ggml_tensor  * norm,
+        float                 norm_eps,
+        float                 pre_scale,
+        int32_t               n_iter) {
+    GGML_ASSERT(x->ne[0] > 0 && x->ne[0] <= INT32_MAX);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0] + 8, x->ne[2]);
+    ggml_set_op_params_f32(result, 0, pre_scale);
+    ggml_set_op_params_i32(result, 1, n_iter);
+    ggml_set_op_params_f32(result, 2, norm_eps);
+
+    result->op     = GGML_OP_HC_ROUTE_2;
+    result->src[0] = x;
+    result->src[1] = weight;
+    result->src[2] = bias;
+    result->src[3] = norm;
+
+    GGML_ASSERT(ggml_hc_route_2_valid(result));
     return result;
 }
 

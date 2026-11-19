@@ -1,6 +1,7 @@
 #include "models.h"
 
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 
 void llama_model_sensenova_loop::load_arch_hparams(llama_model_loader & ml) {
@@ -165,6 +166,83 @@ ggml_tensor * llama_model_sensenova_loop::graph::build_merge(
     return ggml_reshape_3d(ctx0, ggml_concat(ctx0, a, b, 0), n_embd, 2, nt);
 }
 
+bool llama_model_sensenova_loop::graph::use_fused_mhc() const {
+    if (!loras->empty() || hdmd || n_embd > INT32_MAX ||
+            !std::isfinite(hparams.f_norm_rms_eps) || hparams.f_norm_rms_eps <= 0.0f) {
+        return false;
+    }
+
+    const auto & loop = static_cast<const llama_model_sensenova_loop &>(model);
+    ggml_backend_dev_t checked_device = nullptr;
+    for (int il = 0; il < n_layer; ++il) {
+        const uint32_t physical = loop.physical_layer(il);
+        if (physical < hparams.mhc_start || physical >= hparams.mhc_end) {
+            continue;
+        }
+
+        // The last-layer output crop uses the separate stream graph.
+        if (il == n_layer - 1) {
+            return false;
+        }
+        const auto device = model.dev_layer(il);
+        const auto reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+        if (!reg || std::strcmp(ggml_backend_reg_name(reg), "MTL") != 0) {
+            return false;
+        }
+        const auto & layer = model.layers[il];
+        for (const auto * t : {layer.hc_attn_fn, layer.hc_attn_fn_b, layer.hc_ffn_fn, layer.hc_ffn_fn_b,
+                              layer.attn_norm, layer.attn_post_norm}) {
+            if (!t || t->type != GGML_TYPE_F32 || !t->buffer ||
+                    ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer)) != device) {
+                return false;
+            }
+        }
+
+        if (device != checked_device) {
+            const ggml_context_ptr probe(ggml_init({6*ggml_tensor_overhead(), nullptr, true}));
+            auto * ctx = probe.get();
+            auto * streams = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 2, n_tokens);
+            auto * route = ggml_hc_route_2(ctx, streams, layer.hc_attn_fn, layer.hc_attn_fn_b, layer.attn_norm,
+                    hparams.f_norm_rms_eps, hparams.mhc_pre_scale, hparams.mhc_iterations);
+            auto * branch = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            auto * post = ggml_view_2d(ctx, route, 2, n_tokens, route->nb[1], n_embd*sizeof(float));
+            auto * mix = hparams.mhc_fixed_identity ? nullptr : ggml_view_3d(ctx, route, 2, 2, n_tokens,
+                    2*sizeof(float), route->nb[1], (n_embd + 2)*sizeof(float));
+            auto * merge = ggml_dsv4_hc_post(ctx, branch, streams, post, mix);
+            if (!ggml_backend_dev_supports_op(device, route) || !ggml_backend_dev_supports_op(device, merge)) {
+                return false;
+            }
+            checked_device = device;
+        }
+    }
+    return true;
+}
+
+ggml_tensor * llama_model_sensenova_loop::graph::build_fused_mhc(
+        ggml_tensor * streams, int il, bool attn,
+        llm_graph_input_mem_hybrid * memory, ggml_tensor * pos) {
+    const int64_t d = streams->ne[0];
+    const int64_t nt = streams->ne[2];
+    const auto & layer = model.layers[il];
+    auto * weight = attn ? layer.hc_attn_fn : layer.hc_ffn_fn;
+    auto * bias = attn ? layer.hc_attn_fn_b : layer.hc_ffn_fn_b;
+    auto * norm = attn ? layer.attn_norm : layer.attn_post_norm;
+    auto * route = ggml_hc_route_2(ctx0, streams, weight, bias, norm, hparams.f_norm_rms_eps,
+            hparams.mhc_pre_scale, hparams.mhc_iterations);
+    cb(route, "mhc_route", il);
+    auto * input = ggml_view_2d(ctx0, route, d, nt, route->nb[1], 0);
+    auto * post = ggml_view_2d(ctx0, route, 2, nt, route->nb[1], d*sizeof(float));
+    auto * mix = hparams.mhc_fixed_identity ? nullptr
+        : ggml_view_3d(ctx0, route, 2, 2, nt, 2*sizeof(float), route->nb[1], (d + 2)*sizeof(float));
+    auto * branch = attn
+        ? (hparams.is_recr(il) ? build_layer_attn_linear(memory->get_recr(), input, il)
+                              : build_layer_attn(memory->get_attn(), input, pos, il))
+        : build_layer_ffn(input, il);
+    auto * result = ggml_dsv4_hc_post(ctx0, branch, streams, post, mix);
+    cb(result, attn ? "mhc_merge_attn" : "mhc_merge_ffn", il);
+    return result;
+}
+
 llama_model_sensenova_loop::graph::graph(const llm_graph_params & params) : graph_base(params) {
     const auto & loop = static_cast<const llama_model_sensenova_loop &>(model);
     auto * inp = build_inp_mem_hybrid();
@@ -172,12 +250,27 @@ llama_model_sensenova_loop::graph::graph(const llm_graph_params & params) : grap
     ggml_tensor * inp_out_ids = build_inp_out_ids();
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
     ggml_tensor * streams = nullptr;
+    const bool fused_mhc = use_fused_mhc();
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
         const uint32_t physical = loop.physical_layer(il);
         const bool mhc = physical >= hparams.mhc_start && physical < hparams.mhc_end;
         res->t_layer_inp[il] = cur;
+        if (mhc && fused_mhc) {
+            if (physical == hparams.mhc_start) {
+                streams = ggml_reshape_3d(ctx0, cur, n_embd, 1, cur->ne[1]);
+                streams = ggml_repeat_4d(ctx0, streams, n_embd, 2, cur->ne[1], 1);
+            }
+            streams = build_fused_mhc(streams, il, true, inp, inp_pos);
+            streams = build_fused_mhc(streams, il, false, inp, inp_pos);
+            streams = build_cvec(streams, il);
+            ggml_tensor * a = ggml_view_2d(ctx0, streams, n_embd, streams->ne[2], streams->nb[2], 0);
+            ggml_tensor * b = ggml_view_2d(ctx0, streams, n_embd, streams->ne[2], streams->nb[2], streams->nb[1]);
+            cur = ggml_scale(ctx0, ggml_add(ctx0, a, b), 0.5f);
+            cb(cur, "l_out", il);
+            continue;
+        }
         if (mhc && physical == hparams.mhc_start) {
             streams = ggml_reshape_3d(ctx0, ggml_concat(ctx0, cur, cur, 0), n_embd, 2, cur->ne[1]);
         }

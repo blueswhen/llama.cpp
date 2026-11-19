@@ -64,6 +64,9 @@ enum ggml_metal_mma_kind ggml_metal_mul_mv_mma_kind(enum ggml_type type, int rt)
     if (type == GGML_TYPE_Q4_0 || (type == GGML_TYPE_Q8_0 && rt == 1)) {
         return GGML_METAL_MMA_KIND_BLK;
     }
+    if (type == GGML_TYPE_Q4_K) {
+        return GGML_METAL_MMA_KIND_Q4_K;
+    }
     return type == GGML_TYPE_Q5_K ? GGML_METAL_MMA_KIND_Q5_K : GGML_METAL_MMA_KIND_GEN;
 }
 
@@ -109,7 +112,8 @@ int64_t ggml_metal_mul_mv_mma_k_step(enum ggml_type type, int rt) {
     if (!ggml_metal_mul_mv_mma_type_supported(type)) {
         return 0;
     }
-    return ggml_metal_mul_mv_mma_kind(type, rt) == GGML_METAL_MMA_KIND_BLK ? ggml_blck_size(type) : GGML_METAL_MMA_K_CHUNK;
+    const auto kind = ggml_metal_mul_mv_mma_kind(type, rt);
+    return kind == GGML_METAL_MMA_KIND_BLK || kind == GGML_METAL_MMA_KIND_Q4_K ? ggml_blck_size(type) : GGML_METAL_MMA_K_CHUNK;
 }
 
 static bool ggml_metal_mul_mat_mma_type_ok(const struct ggml_tensor * op) {
@@ -142,7 +146,11 @@ static int64_t ggml_metal_mul_mv_mma_rows_min(enum ggml_type type) {
     }
 }
 
-bool ggml_metal_op_mul_mat_use_mma(const struct ggml_tensor * op) {
+bool ggml_metal_op_mul_mat_use_mma(const struct ggml_tensor * op, bool has_simdgroup_mm) {
+    if (!has_simdgroup_mm || ggml_is_empty(op->src[0]) || ggml_is_empty(op->src[1])) {
+        return false;
+    }
+
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
 
@@ -157,6 +165,13 @@ bool ggml_metal_op_mul_mat_use_mma(const struct ggml_tensor * op) {
 
 bool ggml_metal_op_mul_mat_may_use_mma(const struct ggml_tensor * op) {
     return ggml_metal_mul_mv_mma_type_supported(op->src[0]->type) && op->src[1]->type == GGML_TYPE_F32;
+}
+
+size_t ggml_metal_op_mul_mat_mma_extra(const struct ggml_tensor * op, bool has_simdgroup_mm) {
+    if (op->src[0]->type != GGML_TYPE_Q4_K || !ggml_metal_op_mul_mat_use_mma(op, has_simdgroup_mm)) {
+        return 0;
+    }
+    return ggml_nelements(op->src[1])/32*sizeof(float);
 }
 
 // represents a memory range (i.e. an interval from a starting address p0 to an ending address p1 in a given buffer pb)

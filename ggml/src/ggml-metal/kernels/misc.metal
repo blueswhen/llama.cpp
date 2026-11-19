@@ -692,6 +692,147 @@ template [[host_name("kernel_fwht_f16_2048")]] kernel kernel_fwht_f16_t kernel_f
 template [[host_name("kernel_fwht_f16_4096")]] kernel kernel_fwht_f16_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, half>;
 template [[host_name("kernel_fwht_f16_8192")]] kernel kernel_fwht_f16_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, half>;
 
+static float hc_softplus(float x) {
+    const float u = exp(-abs(x));
+    return max(x, 0.0f) + (u < 1e-4f ? u*(1.0f - 0.5f*u) : log(1.0f + u));
+}
+
+static float hc_sigmoid(float x) {
+    return 1.0f/(1.0f + exp(-x));
+}
+
+static float4 hc_sinkhorn_2(float4 logits, int n_iter) {
+    const float d0 = logits.x - logits.y;
+    const float d1 = logits.z - logits.w;
+    float a = hc_softplus(-d1) - hc_softplus(-d0);
+    float b = hc_softplus( d1) - hc_softplus( d0);
+
+    if (n_iter > 1) {
+        const float hi = max(a, 0.0f) + max(b, 0.0f);
+        const float lo = min(a, 0.0f) + min(b, 0.0f);
+        const float range = hi - lo;
+        constexpr float log_two = 0.6931471805599453f;
+        float power = log_two - hc_softplus(-range);
+        float sum = 0.0f;
+        bool have_sum = false;
+
+        // Compose the finite two-stream normalization steps by squaring.
+        for (int n = n_iter - 1; n; n >>= 1) {
+            if (n & 1) {
+                sum = have_sum ? (sum + hc_softplus(power - sum)) - hc_softplus((sum + power) - range) : power;
+                have_sum = true;
+            }
+            if (n > 1) {
+                power = (power - hc_softplus(2.0f*power - range)) + log_two;
+            }
+        }
+        const float shift = hc_softplus(sum - hi) - hc_softplus(sum + lo);
+        a += shift;
+        b += shift;
+    }
+
+    return float4(hc_sigmoid(a), hc_sigmoid(-a), hc_sigmoid(b), hc_sigmoid(-b));
+}
+
+kernel void kernel_hc_route_2_f32(
+        constant ggml_metal_kargs_hc_route_2 & args,
+        device const char * x,
+        device const char * weight,
+        device const float * bias,
+        device const packed_float4 * scale,
+        device char * dst,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    threadgroup float partial[10][OP_HC_ROUTE_MAX_NSG];
+    const uint it = tgpig.x;
+    const ushort tid = tpitg.x;
+    const ushort nsg = ntg.x/32;
+    const int d = args.n_embd;
+    const int nv = d/4;
+    device const char * streams = x + it*args.nb_x2;
+    device const packed_float4 * a = (device const packed_float4 *) streams;
+    device const packed_float4 * b = (device const packed_float4 *) (streams + args.nb_x1);
+    device float * out = (device float *) (dst + it*args.nb_d1);
+
+    float sum = 0.0f;
+    for (int i = tid; i < nv; i += ntg.x) {
+        const float4 av = a[i];
+        const float4 bv = b[i];
+        sum += dot(av, av) + dot(bv, bv);
+    }
+
+    sum = simd_sum(sum);
+    if (lane == 0) {
+        partial[0][sg] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float norm = rsqrt(simd_sum(lane < nsg ? partial[0][lane] : 0.0f)/(2.0f*d) + 1e-6f);
+    float proj[8] = {};
+    for (int i = tid; i < nv; i += ntg.x) {
+        const float4 av = float4(a[i])*norm;
+        const float4 bv = float4(b[i])*norm;
+        FOR_UNROLL (int j = 0; j < 8; ++j) {
+            if (j < args.n_logits) {
+                device const packed_float4 * w = (device const packed_float4 *) (weight + j*args.nb_w1);
+                proj[j] += dot(av, float4(w[i])) + dot(bv, float4(w[nv + i]));
+            }
+        }
+    }
+
+    FOR_UNROLL (int j = 0; j < 8; ++j) {
+        const float value = simd_sum(proj[j]);
+        if (lane == 0) {
+            partial[j + 1][sg] = value;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float pre_a = hc_sigmoid(simd_sum(lane < nsg ? partial[1][lane] : 0.0f) + bias[0]);
+    const float pre_b = hc_sigmoid(simd_sum(lane < nsg ? partial[2][lane] : 0.0f) + bias[1]);
+    float branch_sum = 0.0f;
+    for (int i = tid; i < nv; i += ntg.x) {
+        const float4 v = args.pre_scale*(pre_a*float4(a[i]) + pre_b*float4(b[i]));
+        branch_sum += dot(v, v);
+    }
+    branch_sum = simd_sum(branch_sum);
+    if (lane == 0) {
+        partial[9][sg] = branch_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float branch_rms = rsqrt(simd_sum(lane < nsg ? partial[9][lane] : 0.0f)/d + args.norm_eps);
+    device packed_float4 * branch = (device packed_float4 *) out;
+    for (int i = tid; i < nv; i += ntg.x) {
+        const float4 v = args.pre_scale*(pre_a*float4(a[i]) + pre_b*float4(b[i]));
+        branch[i] = (v*branch_rms)*float4(scale[i]);
+    }
+
+    if (sg == 0) {
+        float logits[8] = {};
+        FOR_UNROLL (int j = 2; j < 8; ++j) {
+            if (j < args.n_logits) {
+                logits[j] = simd_sum(lane < nsg ? partial[j + 1][lane] : 0.0f) + bias[j];
+            }
+        }
+        if (lane == 0) {
+            const float4 mix = args.n_logits == 8 ?
+                hc_sinkhorn_2(float4(logits[4], logits[5], logits[6], logits[7]), args.n_iter) : float4(1, 0, 0, 1);
+            out[d]     = 2.0f*hc_sigmoid(logits[2]);
+            out[d + 1] = 2.0f*hc_sigmoid(logits[3]);
+            out[d + 2] = mix.x;
+            out[d + 3] = mix.y;
+            out[d + 4] = mix.z;
+            out[d + 5] = mix.w;
+            out[d + 6] = 0.0f;
+            out[d + 7] = 0.0f;
+        }
+    }
+}
+
 constant int FC_dsv4_hc_n_hc [[function_constant(FC_DSV4_HC + 0)]];
 
 kernel void kernel_dsv4_hc_comb_f32(
@@ -820,7 +961,7 @@ kernel void kernel_dsv4_hc_post_nocomb_f32(
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
-    constexpr ushort hc = 4;
+    const ushort hc = FC_dsv4_hc_n_hc;
 
     const int it = tgpig.y;
     const int i0 = ((int) tgpig.x*ntg.y + sgitg)*32 + tiisg;
@@ -830,7 +971,7 @@ kernel void kernel_dsv4_hc_post_nocomb_f32(
         post_lane = *(device const float *) (post + tiisg*args.nb_p0 + it*args.nb_p1);
     }
 
-    float post_reg[hc];
+    float post_reg[4];
     FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
         post_reg[idst] = simd_shuffle(post_lane, idst);
     }
@@ -847,6 +988,37 @@ kernel void kernel_dsv4_hc_post_nocomb_f32(
     }
 }
 
+kernel void kernel_hc_post_2_vec_f32(
+        constant ggml_metal_kargs_dsv4_hc_post & args,
+        device const char * x,
+        device const char * residual,
+        device const char * post,
+        device const char * comb,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint it = tgpig.y;
+    const uint i = tgpig.x*64 + tpitg.x;
+    if (i >= uint(args.n_embd)/4) {
+        return;
+    }
+
+    device const float * p = (device const float *) (post + it*args.nb_p1);
+    device const float * c0 = (device const float *) (comb + it*args.nb_c2);
+    device const float * c1 = (device const float *) ((device const char *) c0 + args.nb_c1);
+    device const packed_float4 * xv = (device const packed_float4 *) (x + it*args.nb_x1);
+    device const packed_float4 * rv = (device const packed_float4 *) (residual + it*args.nb_r2);
+    device const packed_float4 * rb = (device const packed_float4 *) ((device const char *) rv + args.nb_r1);
+    device packed_float4 * out_a = (device packed_float4 *) (dst + it*args.nb_d2);
+    device packed_float4 * out_b = (device packed_float4 *) ((device char *) out_a + args.nb_d1);
+
+    const float4 a = rv[i];
+    const float4 b = rb[i];
+    const float4 v = xv[i];
+    out_a[i] = fma(b, c1[0], fma(a, c0[0], v*p[0]));
+    out_b[i] = fma(b, c1[1], fma(a, c0[1], v*p[1]));
+}
+
 kernel void kernel_dsv4_hc_post_f32(
         constant ggml_metal_kargs_dsv4_hc_post & args,
         device const char * x,
@@ -858,7 +1030,7 @@ kernel void kernel_dsv4_hc_post_f32(
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
-    constexpr ushort hc = 4;
+    const ushort hc = FC_dsv4_hc_n_hc;
 
     const int it = tgpig.y;
     const int i0 = ((int) tgpig.x*ntg.y + sgitg)*32 + tiisg;
@@ -868,13 +1040,13 @@ kernel void kernel_dsv4_hc_post_f32(
         coeff_lane = *(device const float *) (post + tiisg*args.nb_p0 + it*args.nb_p1);
     } else if (tiisg < hc + hc*hc) {
         const ushort idx  = tiisg - hc;
-        const ushort idst = idx & 3;
-        const ushort isrc = idx >> 2;
+        const ushort idst = idx % hc;
+        const ushort isrc = idx / hc;
         coeff_lane = *(device const float *) (comb + idst*args.nb_c0 + isrc*args.nb_c1 + it*args.nb_c2);
     }
 
-    float post_reg[hc];
-    float comb_reg[hc][hc];
+    float post_reg[4];
+    float comb_reg[4][4];
     FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
         post_reg[idst] = simd_shuffle(coeff_lane, idst);
     }
@@ -889,7 +1061,7 @@ kernel void kernel_dsv4_hc_post_f32(
     }
 
     const float xv = *(device const float *) (x + i0*args.nb_x0 + it*args.nb_x1);
-    float result[hc];
+    float result[4];
     FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
         result[idst] = xv*post_reg[idst];
     }
