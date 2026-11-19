@@ -167,6 +167,33 @@ static float ggml_get_op_params_f32(const struct ggml_tensor * tensor, uint32_t 
     return ((const float *)(tensor->op_params))[i];
 }
 
+static inline bool ggml_hc_route_2_valid(const struct ggml_tensor * op) {
+    const struct ggml_tensor * x = op->src[0];
+    const struct ggml_tensor * w = op->src[1];
+    const struct ggml_tensor * b = op->src[2];
+    const struct ggml_tensor * norm = op->src[3];
+    if (!x || !w || !b || !norm) {
+        return false;
+    }
+
+    const int64_t d = x->ne[0];
+    const int32_t n_iter = ggml_get_op_params_i32(op, 1);
+    const float norm_eps = ggml_get_op_params_f32(op, 2);
+    const float pre_scale = ggml_get_op_params_f32(op, 0);
+    return d > 0 && d <= INT32_MAX && x->ne[1] == 2 && x->ne[3] == 1 &&
+        x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 &&
+        b->type == GGML_TYPE_F32 && norm->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+        w->ne[0] == 2*d && (w->ne[1] == 4 || w->ne[1] == 8) && ggml_is_matrix(w) &&
+        b->ne[0] == w->ne[1] && ggml_is_vector(b) &&
+        norm->ne[0] == d && ggml_is_vector(norm) &&
+        op->ne[0] == d + 8 && op->ne[1] == x->ne[2] && ggml_is_matrix(op) &&
+        ggml_is_contiguous_rows(x) && ggml_is_contiguous_rows(w) &&
+        ggml_is_contiguous(b) && ggml_is_contiguous(norm) && ggml_is_contiguous(op) &&
+        n_iter > 0 && n_iter <= 20 && isfinite(norm_eps) && norm_eps > 0.0f &&
+        isfinite(pre_scale) && pre_scale > 0.0f;
+}
+
+
 // [TAG_GGML_PREC]
 // - GGML_OP_MUL_MAT
 //   0 - acc

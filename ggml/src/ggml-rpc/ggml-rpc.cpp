@@ -512,6 +512,11 @@ private:
     std::condition_variable cvar;
 };
 
+struct rpc_alloc_size_cache {
+    std::mutex mutex;
+    std::unordered_map<uint64_t, size_t> sizes;
+};
+
 class rpc_dispatcher {
 public:
     rpc_dispatcher() {
@@ -533,6 +538,8 @@ public:
     void work();
 
     bool get_send_tensor_hash() const { return flags & RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH; }
+
+    rpc_alloc_size_cache q4_matmul_alloc_sizes;
 
     ~rpc_dispatcher();
 
@@ -1078,7 +1085,7 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         const size_t min_size = ggml_nbytes(tensor);
 
         // Cache key for calls to read the alloc_size.
-        // We deliberately exclude src tensor dimensions from the key because:
+        // Normally exclude src tensor dimensions from the key because:
         // 1. For CPU backends, alloc_size = ggml_nbytes(output) regardless of src shapes
         // 2. For GPU backends, the reservation graph uses max dimensions, so the
         //    cached value from reservation is always >= any subsequent request
@@ -1090,6 +1097,11 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             uint32_t op;
             int32_t  op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
             uint32_t ne[GGML_MAX_DIMS];
+            uint64_t nb[GGML_MAX_DIMS];
+        };
+        struct alloc_size_cache_src {
+            uint64_t type;
+            int64_t  ne[GGML_MAX_DIMS];
             uint64_t nb[GGML_MAX_DIMS];
         };
 
@@ -1106,14 +1118,33 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         uint64_t cache_hash = fnv_hash((const uint8_t *)&key, sizeof(key));
         cache_hash = fnv_hash((const uint8_t *)buft_ctx->endpoint.data(), buft_ctx->endpoint.size(), cache_hash);
 
-        // alloc sizes are immutable for a given tensor configuration
-        static std::mutex cache_mutex;
-        static std::unordered_map<uint64_t, size_t> cache;
+        // Metal's few-row MUL_MAT workspace depends on source type, K, and strides.
+        const bool q4_matmul = tensor->op == GGML_OP_MUL_MAT && tensor->src[0]->type == GGML_TYPE_Q4_K && tensor->src[1]->type == GGML_TYPE_F32;
+        std::shared_ptr<rpc_dispatcher> dispatcher;
+        if (q4_matmul) {
+            dispatcher = get_dispatcher(buft_ctx->endpoint);
+            if (dispatcher == nullptr) {
+                return min_size;
+            }
+            for (const auto * src : {tensor->src[0], tensor->src[1]}) {
+                alloc_size_cache_src src_key = {};
+                src_key.type = src->type;
+                for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                    src_key.ne[i] = src->ne[i];
+                    src_key.nb[i] = src->nb[i];
+                }
+                cache_hash = fnv_hash((const uint8_t *)&src_key, sizeof(src_key), cache_hash);
+            }
+        }
+
+        // Keep Q4_K sizes per connection so a server upgrade cannot reuse sizes without workspace.
+        static rpc_alloc_size_cache shared_cache;
+        auto & cache = q4_matmul ? dispatcher->q4_matmul_alloc_sizes : shared_cache;
 
         {
-            std::lock_guard<std::mutex> lock(cache_mutex);
-            auto it = cache.find(cache_hash);
-            if (it != cache.end()) {
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            auto it = cache.sizes.find(cache_hash);
+            if (it != cache.sizes.end()) {
                 LOG_DBG3("[%s] cache hit: %s -> %s\n", __func__, rpc_log_format_tensor(tensor).c_str(),
                          rpc_log_format_size(it->second).c_str());
                 return std::max<size_t>(it->second, min_size);
@@ -1131,15 +1162,17 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
 
         LOG_DBG2("[%s] cache miss: %s, querying server\n", __func__, rpc_log_format_tensor(tensor).c_str());
         rpc_msg_get_alloc_size_rsp response;
-        auto dispatcher = get_dispatcher(buft_ctx->endpoint);
         if (dispatcher == nullptr) {
-            return min_size;
+            dispatcher = get_dispatcher(buft_ctx->endpoint);
+            if (dispatcher == nullptr) {
+                return min_size;
+            }
         }
         dispatcher->send(RPC_CMD_GET_ALLOC_SIZE, request, sizeof(*request), nullptr, 0, &response, sizeof(response));
 
         {
-            std::lock_guard<std::mutex> lock(cache_mutex);
-            cache[cache_hash] = response.alloc_size;
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            cache.sizes[cache_hash] = response.alloc_size;
         }
 
         LOG_DBG2("[%s] %s -> alloc_size: %s\n", __func__, rpc_log_format_tensor(tensor).c_str(),
@@ -3113,9 +3146,8 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
     //TODO: call the remote backend and cache the results
-    return true;
+    return op->op != GGML_OP_HC_ROUTE_2;
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {

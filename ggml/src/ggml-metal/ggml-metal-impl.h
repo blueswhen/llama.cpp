@@ -1401,6 +1401,20 @@ typedef struct {
 } ggml_metal_kargs_dsv4_hc_post;
 
 typedef struct {
+    int32_t  n_embd;
+    int32_t  n_logits;
+    int32_t  n_iter;
+    float    pre_scale;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb_w1;
+    uint64_t nb_d1;
+    float    norm_eps;
+} ggml_metal_kargs_hc_route_2;
+
+#define OP_HC_ROUTE_MAX_NSG 32
+
+typedef struct {
     int32_t  ne00;
     int32_t  ne01;
     int32_t  ne02;

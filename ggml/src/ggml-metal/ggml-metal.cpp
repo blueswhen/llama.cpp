@@ -3,6 +3,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include "ggml-metal-common.h"
 #include "ggml-metal-device.h"
 #include "ggml-metal-fusion.h"
 #include "ggml-metal-context.h"
@@ -288,6 +289,13 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
 
     // some operations require additional memory for fleeting data:
     switch (tensor->op) {
+        case GGML_OP_MUL_MAT:
+            {
+                auto ctx_dev = (ggml_metal_device_t) buft->device->context;
+                const size_t extra = ggml_metal_op_mul_mat_mma_extra(tensor, ggml_metal_device_get_props(ctx_dev)->has_simdgroup_mm);
+                GGML_ASSERT(res <= SIZE_MAX - extra);
+                res += extra;
+            } break;
         case GGML_OP_MUL_MAT_ID:
             {
                 res += ggml_metal_op_mul_mat_id_extra_tpe(tensor);

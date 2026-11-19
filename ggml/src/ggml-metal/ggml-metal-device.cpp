@@ -563,7 +563,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
             break;
         case GGML_OP_DSV4_HC_POST:
             base = op->src[3] ? "kernel_dsv4_hc_post_f32" : "kernel_dsv4_hc_post_nocomb_f32";
-            snprintf(name, 256, "%s", base);
+            snprintf(name, 256, "%s_n_hc=%d", base, (int) op->src[1]->ne[1]);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -573,9 +573,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
     if (!res.pipeline) {
         ggml_metal_cv_t cv = nullptr;
 
-        if (op->op == GGML_OP_DSV4_HC_PRE) {
+        if (op->op == GGML_OP_DSV4_HC_PRE || op->op == GGML_OP_DSV4_HC_POST) {
             cv = ggml_metal_cv_init();
-            ggml_metal_cv_set_int32(cv, (int32_t) op->src[0]->ne[1], FC_DSV4_HC + 0);
+            const auto * streams = op->src[op->op == GGML_OP_DSV4_HC_PRE ? 0 : 1];
+            ggml_metal_cv_set_int32(cv, (int32_t) streams->ne[1], FC_DSV4_HC + 0);
         }
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);

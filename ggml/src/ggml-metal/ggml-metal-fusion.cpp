@@ -803,7 +803,7 @@ static bool ggml_metal_fusion_check_mul_mat_add(
 
     const ggml_tensor * res = ggml_metal_mul_mat_add_residual(mm, add);
 
-    if (res == nullptr || !ggml_metal_op_mul_mat_use_mma(mm)) {
+    if (res == nullptr || !ggml_metal_op_mul_mat_use_mma(mm, true)) {
         return false;
     }
 

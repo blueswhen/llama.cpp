@@ -4994,6 +4994,50 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 };
 
 
+struct test_hc_route_2 : public test_case {
+    const int64_t d;
+    const int64_t n_tokens;
+    const int n_iter;
+    const bool identity;
+    const bool strided;
+    const bool large_projection;
+
+    test_hc_route_2(int64_t d, int64_t n_tokens, int n_iter, bool identity, bool strided = false, bool large_projection = false)
+        : d(d), n_tokens(n_tokens), n_iter(n_iter), identity(identity), strided(strided), large_projection(large_projection) {}
+
+    std::string vars() override {
+        return VARS_TO_STR6(d, n_tokens, n_iter, identity, strided, large_projection);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_logits = identity ? 4 : 8;
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, strided ? d + 4 : d, 2, n_tokens);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided ? 2*d + 4 : 2*d, n_logits);
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_logits);
+        if (strided) {
+            x = ggml_view_3d(ctx, x, d, 2, n_tokens, x->nb[1], x->nb[2], sizeof(float));
+            w = ggml_view_2d(ctx, w, 2*d, n_logits, w->nb[1], sizeof(float));
+        }
+        ggml_tensor * norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d);
+        ggml_set_name(x, "streams");
+        ggml_set_name(w, "router");
+        return ggml_hc_route_2(ctx, x, w, b, norm, 1e-6f, 0.75f, n_iter);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        if (large_projection) {
+            ggml_tensor * x = ggml_get_tensor(ctx, "streams");
+            ggml_tensor * w = ggml_get_tensor(ctx, "router");
+            init_tensor_uniform(x, 1024.0f, 1024.0f);
+            std::vector<float> data(ggml_nelements(w), 0.0f);
+            std::fill_n(data.begin(), d, 1e37f);
+            std::fill_n(data.begin() + d, d, -1e37f);
+            ggml_backend_tensor_set(w, data.data(), 0, data.size()*sizeof(float));
+        }
+    }
+};
+
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -5851,6 +5895,26 @@ struct test_mul_mat : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
+struct test_mul_mat_q4_K_view : public test_mul_mat {
+    explicit test_mul_mat_q4_K_view(int64_t n)
+        : test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, n, 256, {2, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 33, 4, 4) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (!ggml_is_view_op(t->op)) {
+                init_tensor_uniform(t);
+            }
+        }
+        ggml_tensor * a = ggml_get_tensor(ctx, "a");
+        const size_t row_size = ggml_row_size(a->type, k);
+        std::vector<uint8_t> rows(m*row_size);
+        ggml_backend_tensor_get(a->view_src, rows.data(), 0, rows.size());
+        for (int64_t i = 0; i < bs[0]; ++i) {
+            ggml_backend_tensor_set(a, rows.data(), i*a->nb[2], rows.size());
+        }
     }
 };
 
@@ -10966,6 +11030,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(4096, 1, false, false, 2));
+    test_cases.emplace_back(new test_dsv4_hc_post(63, 17, true, false, 2));
+    test_cases.emplace_back(new test_hc_route_2(68, 7, 1, false, true));
+    test_cases.emplace_back(new test_hc_route_2(4, 1, 20, false, false, true));
+    test_cases.emplace_back(new test_hc_route_2(4096, 1, 20, false));
+    test_cases.emplace_back(new test_hc_route_2(4096, 8, 20, false));
+    test_cases.emplace_back(new test_hc_route_2(4096, 32, 20, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 1));             // DeepSeek-V4-Flash decode
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true)); // Qwen4-Exp decode
     for (int64_t n_tokens : {1, 17, 512}) {
@@ -12244,6 +12315,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 1024, { 1, 1 }, { 1, 1 }));
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1023, n, 4096, { 1, 1 }, { 1, 1 }));
         }
+    }
+
+    for (int n : {3, 13}) {
+        test_cases.emplace_back(new test_mul_mat_q4_K_view(n));
     }
 
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
@@ -14246,7 +14321,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, n, 14336, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 14336, n, 4096, {1, 1}, {1, 1}));
     }
-
     // Q4_K multi-column mat-vec
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {
