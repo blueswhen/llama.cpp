@@ -958,7 +958,7 @@ void kernel_mul_mv_t_t_impl(
     // pointers to src0 rows
     device const T0 * ax [NR0];
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
-        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+        const uint64_t offset0 = min(r0 + row, args.ne01 - 1)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
 
         ax[row] = (device const T0 *) ((device char *) src0 + offset0);
     }
@@ -1082,7 +1082,7 @@ void kernel_mul_mv_t_t_4_impl(
     device const T0  * ax [NR0];
     device const T04 * ax4[NR0];
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
-        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+        const uint64_t offset0 = min(r0 + row, args.ne01 - 1)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
 
         ax [row] = (device const T0  *) ((device char *) src0 + offset0);
         ax4[row] = (device const T04 *) ((device char *) src0 + offset0);
