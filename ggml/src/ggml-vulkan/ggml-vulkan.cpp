@@ -16440,7 +16440,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         return false;
                     }
                 }
-                if (ggml_prec_get_src(op, 1) == GGML_PREC_BF16 || ggml_prec_get_src(op, 1) == GGML_PREC_F32) {
+                // F32 x F32 already uses F32 B and F32 accumulation
+                if (ggml_prec_get_src(op, 1) == GGML_PREC_BF16 ||
+                    (ggml_prec_get_src(op, 1) == GGML_PREC_F32 &&
+                     !(op->op == GGML_OP_MUL_MAT && src0_type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32))) {
                     return false;
                 }
                 switch (src0_type) {
