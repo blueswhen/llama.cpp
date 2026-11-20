@@ -1,7 +1,6 @@
 #include "models.h"
 
 #include <cmath>
-#include <cstring>
 #include <stdexcept>
 
 void llama_model_sensenova_loop::load_arch_hparams(llama_model_loader & ml) {
@@ -195,8 +194,8 @@ bool llama_model_sensenova_loop::graph::use_fused_mhc() const {
             return false;
         }
         const auto device = model.dev_layer(il);
-        const auto reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
-        if (!reg || std::strcmp(ggml_backend_reg_name(reg), "MTL") != 0) {
+        const auto type = device ? ggml_backend_dev_type(device) : GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
             return false;
         }
         const auto & layer = model.layers[il];

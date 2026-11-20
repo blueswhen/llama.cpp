@@ -217,6 +217,23 @@ struct vk_op_dsv4_hc_comb_push_constants {
     uint32_t n_iter;
 };
 
+struct vk_op_hc_route_2_push_constants {
+    uint32_t n_embd;
+    uint32_t n_logits;
+    uint32_t n_iter;
+    uint32_t nbx1;
+    uint32_t nbx2;
+    uint32_t nbw1;
+    uint32_t nbd1;
+    uint32_t x_offset;
+    uint32_t w_offset;
+    uint32_t b_offset;
+    uint32_t n_offset;
+    uint32_t d_offset;
+    float norm_eps;
+    float pre_scale;
+};
+
 struct vk_op_dsv4_hc_pre_push_constants {
     uint32_t n_embd;
     uint32_t n_tokens;

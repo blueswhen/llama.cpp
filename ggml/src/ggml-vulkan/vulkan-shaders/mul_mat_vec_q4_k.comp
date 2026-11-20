@@ -5,6 +5,7 @@
 #include "mul_mat_vec_base.glsl"
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 3) const bool WIDE_K = false;
 
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 
@@ -84,9 +85,63 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im, 
     }
 }
 
+vec2 dot_q4_pair(uint q, vec4 low, vec4 high) {
+    return vec2(dot(vec4(unpack8(q & 0x0F0F0F0F)), low),
+                dot(vec4(unpack8((q >> 4) & 0x0F0F0F0F)), high));
+}
+
+void compute_wide_k(uint a_offset, uint b_offset, uint first_row, uint num_rows) {
+    // Eight lanes process each superblock, sharing activations across rows.
+    const uint tid = gl_LocalInvocationID.x;
+    const uint half_block = (tid % 8) / 4;
+    const uint q_offset = 8*half_block + 2*(tid % 4);
+    const uint y_offset = 16*half_block + 2*(tid % 4);
+    const uint num_blocks_per_row = p.ncols / QUANT_K;
+
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        temp[0][n] = FLOAT_TYPE(0);
+    }
+    for (uint i = tid/8; i < num_blocks_per_row; i += BLOCK_SIZE/8) {
+        const uint y = (b_offset + i*QUANT_K)/4 + y_offset;
+        const vec4 lo0 = vec4(data_b_v4[y]);
+        const vec4 lo1 = vec4(data_b_v4[y + 1]);
+        const vec4 hi0 = vec4(data_b_v4[y + 8]);
+        const vec4 hi1 = vec4(data_b_v4[y + 9]);
+        const vec4 lo2 = vec4(data_b_v4[y + 32]);
+        const vec4 lo3 = vec4(data_b_v4[y + 33]);
+        const vec4 hi2 = vec4(data_b_v4[y + 40]);
+        const vec4 hi3 = vec4(data_b_v4[y + 41]);
+        const vec4 ones = vec4(1.0);
+        const vec4 sum_y = vec4(dot(lo0 + lo1, ones), dot(hi0 + hi1, ones), dot(lo2 + lo3, ones), dot(hi2 + hi3, ones));
+
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const uint block = a_offset + (first_row + n)*num_blocks_per_row + i;
+            const uint scale0 = data_a_packed16[block].scales[half_block];
+            const uint scale4 = data_a_packed16[block].scales[half_block + 2];
+            const uint scale8 = data_a_packed16[block].scales[half_block + 4];
+            const uint packed_sc = (scale4 << 16) | scale0;
+            const vec4 sc0 = vec4(unpack8(packed_sc & 0x3F3F3F3F));
+            const vec4 sc1 = vec4(unpack8((((scale8 << 12) | scale8) & 0x0F0F0F0F) | ((packed_sc & 0xC0C0C0C0) >> 2)));
+            const vec2 low = dot_q4_pair(data_a_packed32[block].qs[q_offset], lo0, hi0) +
+                             dot_q4_pair(data_a_packed32[block].qs[q_offset + 1], lo1, hi1);
+            const vec2 high = dot_q4_pair(data_a_packed32[block].qs[q_offset + 16], lo2, hi2) +
+                              dot_q4_pair(data_a_packed32[block].qs[q_offset + 17], lo3, hi3);
+            const vec2 dm = vec2(data_a[block].dm);
+            const float coeff = dot(vec4(low, high), vec4(sc0.xy, sc1.xy));
+            const float min_term = dot(sum_y, vec4(sc0.zw, sc1.zw));
+            temp[0][n] += FLOAT_TYPE(fma(dm.x, coeff, -dm.y*min_term));
+        }
+    }
+}
+
 void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     uint a_offset, b_offset, d_offset;
     get_offsets(a_offset, b_offset, d_offset);
+    if (WIDE_K && NUM_COLS == 1) {
+        compute_wide_k(a_offset, b_offset, first_row, num_rows);
+        reduce_result(temp, d_offset, first_row, num_rows, gl_LocalInvocationID.x);
+        return;
+    }
 
     const uint num_blocks_per_row = p.ncols / QUANT_K;
 
