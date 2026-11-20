@@ -14,6 +14,7 @@
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 256;
 layout(constant_id = 1) const uint HAS_COMB = 1;
+layout(constant_id = 2) const uint HC = 4;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -45,22 +46,20 @@ layout(binding = 2, std430) readonly buffer P { float data_p[]; };
 layout(binding = 3, std430) readonly buffer C { float data_c[]; };
 layout(binding = 4, std430) writeonly buffer D { float data_d[]; };
 
-const uint hc = 4;
-
-shared float post_s[hc];
-shared float comb_s[hc * hc];
+shared float post_s[HC];
+shared float comb_s[HC * HC];
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
     const uint it  = gl_WorkGroupID.y;
 
-    if (tid < hc) {
+    if (tid < HC) {
         const float p = data_p[p_offset + tid * nbp0 + it * nbp1];
         post_s[tid] = gate != 0 ? (1.0f / (1.0f + exp(-(p * gate_scale_in)))) * gate_scale_out : p;
     }
-    if (HAS_COMB == 1 && tid < hc * hc) {
-        const uint idst = tid & 3;
-        const uint isrc = tid >> 2;
+    if (HAS_COMB == 1 && tid < HC * HC) {
+        const uint idst = tid % HC;
+        const uint isrc = tid / HC;
         comb_s[tid] = data_c[c_offset + idst * nbc0 + isrc * nbc1 + it * nbc2];
     }
     barrier();
@@ -75,19 +74,19 @@ void main() {
 
     const uint rb = r_offset + i0 * nbr0 + it * nbr2;
 
-    float r[hc];
+    float r[HC];
     [[unroll]]
-    for (uint isrc = 0; isrc < hc; ++isrc) {
+    for (uint isrc = 0; isrc < HC; ++isrc) {
         r[isrc] = data_r[rb + isrc * nbr1];
     }
 
     [[unroll]]
-    for (uint idst = 0; idst < hc; ++idst) {
+    for (uint idst = 0; idst < HC; ++idst) {
         float result = xv * post_s[idst];
         if (HAS_COMB == 1) {
             [[unroll]]
-            for (uint isrc = 0; isrc < hc; ++isrc) {
-                result = fma(r[isrc], comb_s[idst + hc * isrc], result);
+            for (uint isrc = 0; isrc < HC; ++isrc) {
+                result = fma(r[isrc], comb_s[idst + HC * isrc], result);
             }
         } else {
             result += r[idst];
