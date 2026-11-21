@@ -4123,6 +4123,45 @@ struct test_rms_norm_back : public test_case {
     }
 };
 
+struct test_rms_norm_scale : public test_case {
+    const int64_t width;
+    const float factor;
+    const float bias;
+    const bool shared;
+    const bool offset;
+    const bool alias;
+    const bool permute;
+
+    test_rms_norm_scale(int64_t width, float factor, float bias, bool shared, bool offset, bool alias = false, bool permute = false)
+        : width(width), factor(factor), bias(bias), shared(shared), offset(offset), alias(alias), permute(permute) {}
+
+    std::string op_desc(ggml_tensor *) override { return "RMS_NORM_SCALE"; }
+    bool run_whole_graph() override { return true; }
+    std::string vars() override { return VARS_TO_STR7(width, factor, bias, shared, offset, alias, permute); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, 8, alias ? 4096 : 2);
+        ggml_set_param(x);
+        if (offset) {
+            x = ggml_view_3d(ctx, x, width, 7, 2, x->nb[1], x->nb[2], sizeof(float));
+        }
+        if (alias) {
+            x = ggml_scale(ctx, x, 1.0f);
+        }
+        if (permute) {
+            x = ggml_permute(ctx, x, 0, 2, 1, 3);
+        }
+        ggml_tensor * rms = ggml_rms_norm(ctx, x, 1e-6f);
+        ggml_tensor * out = ggml_scale_bias(ctx, rms, factor, bias);
+        if (alias) {
+            // Reuse the input allocation across the fused region.
+            out->view_src = x->view_src ? x->view_src : x;
+            out->view_offs = x->view_offs;
+        }
+        return shared ? ggml_add(ctx, out, rms) : out;
+    }
+};
+
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
@@ -11034,7 +11073,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(63, 17, true, false, 2));
     test_cases.emplace_back(new test_hc_route_2(68, 7, 1, false, true));
     test_cases.emplace_back(new test_hc_route_2(4, 1, 20, false, false, true));
-    test_cases.emplace_back(new test_hc_route_2(4096, 1, 20, false));
+    for (int64_t d : {1023, 1024, 1025, 4096}) {
+        for (bool identity : {false, true}) {
+            for (bool strided : {false, true}) {
+                test_cases.emplace_back(new test_hc_route_2(d, 1, 20, identity, strided));
+            }
+        }
+    }
     test_cases.emplace_back(new test_hc_route_2(4096, 8, 20, false));
     test_cases.emplace_back(new test_hc_route_2(4096, 32, 20, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 1));             // DeepSeek-V4-Flash decode
@@ -12045,6 +12090,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, true, false));
     }
 
+    for (int64_t n : {127, 128, 129, 4096}) {
+        for (float factor : {0.0f, -0.5f, 0.08838835f}) {
+            for (bool shared : {false, true}) {
+                for (bool offset : {false, true}) {
+                    for (float bias : {0.0f, 0.25f}) {
+                        test_cases.emplace_back(new test_rms_norm_scale(n, factor, bias, shared, offset));
+                    }
+                }
+            }
+        }
+    }
+    for (bool permute : {false, true}) {
+        for (bool alias : {false, true}) {
+            test_cases.emplace_back(new test_rms_norm_scale(128, -0.5f, 0.25f, false, false, alias, permute));
+        }
+    }
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 3, 2 }, 1e-6f, false, false, true));

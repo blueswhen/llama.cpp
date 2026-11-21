@@ -5,6 +5,9 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 128;
+layout(constant_id = 1) const uint ROW_PARALLEL = 0;
+layout(constant_id = 2) const uint FIXED_EMBD = 0;
+layout(constant_id = 3) const uint ROUTE_STAGE = 0;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform parameter {
@@ -28,13 +31,13 @@ layout(binding = 0, std430) readonly buffer X { float data_x[]; };
 layout(binding = 1, std430) readonly buffer W { float data_w[]; };
 layout(binding = 2, std430) readonly buffer B { float data_b[]; };
 layout(binding = 3, std430) readonly buffer N { float data_n[]; };
-layout(binding = 4, std430) writeonly buffer D { float data_d[]; };
+layout(binding = 4, std430) buffer D { float data_d[]; };
 layout(binding = 0, std430) readonly buffer X4 { vec4 data_x4[]; };
 layout(binding = 1, std430) readonly buffer W4 { vec4 data_w4[]; };
 layout(binding = 3, std430) readonly buffer N4 { vec4 data_n4[]; };
 layout(binding = 4, std430) writeonly buffer D4 { vec4 data_d4[]; };
 
-shared float partial[10][BLOCK_SIZE];
+shared float partial[10][128];
 
 vec4 load_x(uint i, bool packed) {
     return packed ? data_x4[i/4] : vec4(data_x[i], 0, 0, 0);
@@ -46,14 +49,15 @@ vec4 load_w(uint i, bool packed) {
 
 void store_sum(uint index, float value) {
     value = subgroupAdd(value);
-    if (subgroupElect()) {
+    if (subgroupElect() && (ROW_PARALLEL == 0 || gl_SubgroupID < 128/gl_SubgroupSize)) {
         partial[index][gl_SubgroupID] = value;
     }
 }
 
 float sum_partials(uint index) {
     float v = 0.0;
-    for (uint i = gl_SubgroupInvocationID; i < gl_NumSubgroups; i += gl_SubgroupSize) {
+    const uint n_groups = ROW_PARALLEL == 0 ? gl_NumSubgroups : 128/gl_SubgroupSize;
+    for (uint i = gl_SubgroupInvocationID; i < n_groups; i += gl_SubgroupSize) {
         v += partial[index][i];
     }
     return subgroupAdd(v);
@@ -99,54 +103,106 @@ vec4 sinkhorn_2(vec4 logits) {
     return vec4(sigmoid(a), sigmoid(-a), sigmoid(b), sigmoid(-b));
 }
 
+float logit(uint index, uint dst, uint embd) {
+    return ROUTE_STAGE == 2 ? data_d[dst + embd + index] : sum_partials(index + 1) + data_b[b_offset + index];
+}
+
+void store_tail(uint dst, uint embd, float post_a, float post_b, vec4 mix) {
+    const uint tail = dst + embd;
+    data_d[tail    ] = post_a;
+    data_d[tail + 1] = post_b;
+    data_d[tail + 2] = mix.x;
+    data_d[tail + 3] = mix.y;
+    data_d[tail + 4] = mix.z;
+    data_d[tail + 5] = mix.w;
+    data_d[tail + 6] = 0.0;
+    data_d[tail + 7] = 0.0;
+}
+
 void main() {
-    const uint tid = gl_LocalInvocationID.x;
-    const uint it = gl_WorkGroupID.x;
+    const uint embd = FIXED_EMBD != 0 ? FIXED_EMBD : n_embd;
+    const uint tid = ROW_PARALLEL == 0 ? gl_LocalInvocationID.x : gl_SubgroupID*gl_SubgroupSize + gl_SubgroupInvocationID;
+    const uint it = ROUTE_STAGE == 1 ? gl_WorkGroupID.x/n_logits : gl_WorkGroupID.x;
     const uint a = x_offset + it*nbx2;
     const uint b = a + nbx1;
     const uint dst = d_offset + it*nbd1;
-    const bool packed = ((n_embd | a | b | w_offset | nbw1 | n_offset | dst) & 3) == 0;
+    const bool packed = FIXED_EMBD != 0 || ((embd | a | b | w_offset | nbw1 | n_offset | dst) & 3) == 0;
     const uint width = packed ? 4 : 1;
-    float sum = 0.0;
-    for (uint i = tid*width; i < n_embd; i += BLOCK_SIZE*width) {
-        const vec4 av = load_x(a + i, packed);
-        const vec4 bv = load_x(b + i, packed);
-        sum += dot(av, av) + dot(bv, bv);
-    }
-    store_sum(0, sum);
-    barrier();
+    const uint reduction_size = ROW_PARALLEL == 0 ? BLOCK_SIZE : 128;
+    if (ROUTE_STAGE != 2) {
+        float sum = 0.0;
+        [[unroll]] for (uint i = tid*width; tid < reduction_size && i < embd; i += reduction_size*width) {
+            const vec4 av = load_x(a + i, packed);
+            const vec4 bv = load_x(b + i, packed);
+            sum += dot(av, av) + dot(bv, bv);
+        }
+        store_sum(0, sum);
+        barrier();
 
-    const float rms = inversesqrt(sum_partials(0)/(2.0*float(n_embd)) + 1e-6);
-    float proj[8] = float[8](0, 0, 0, 0, 0, 0, 0, 0);
-    for (uint i = tid*width; i < n_embd; i += BLOCK_SIZE*width) {
-        const vec4 av = load_x(a + i, packed)*rms;
-        const vec4 bv = load_x(b + i, packed)*rms;
-        [[unroll]] for (uint j = 0; j < 8; ++j) {
-            if (j < n_logits) {
-                const uint row = w_offset + j*nbw1 + i;
-                proj[j] += dot(av, load_w(row, packed)) + dot(bv, load_w(row + n_embd, packed));
+        const float rms = inversesqrt(sum_partials(0)/(2.0*float(embd)) + 1e-6);
+        if (ROW_PARALLEL != 0) {
+            const uint row = ROUTE_STAGE == 1 ? gl_WorkGroupID.x % n_logits : tid/128;
+            const uint lane = tid % 128;
+            if (row < n_logits) {
+                float proj = 0.0;
+                [[unroll]] for (uint i = lane*width; i < embd; i += 128*width) {
+                    const vec4 av = load_x(a + i, packed)*rms;
+                    const vec4 bv = load_x(b + i, packed)*rms;
+                    const uint w = w_offset + row*nbw1 + i;
+                    proj += dot(av, load_w(w, packed)) + dot(bv, load_w(w + embd, packed));
+                }
+                proj = subgroupAdd(proj);
+                if (subgroupElect()) {
+                    partial[row + 1][gl_SubgroupID % (128/gl_SubgroupSize)] = proj;
+                }
+            }
+        } else {
+            float proj[8] = float[8](0, 0, 0, 0, 0, 0, 0, 0);
+            [[unroll]] for (uint i = tid*width; i < embd; i += BLOCK_SIZE*width) {
+                const vec4 av = load_x(a + i, packed)*rms;
+                const vec4 bv = load_x(b + i, packed)*rms;
+                [[unroll]] for (uint j = 0; j < 8; ++j) {
+                    if (j < n_logits) {
+                        const uint row = w_offset + j*nbw1 + i;
+                        proj[j] += dot(av, load_w(row, packed)) + dot(bv, load_w(row + embd, packed));
+                    }
+                }
+            }
+            [[unroll]] for (uint j = 0; j < 8; ++j) {
+                if (j < n_logits) {
+                    store_sum(j + 1, proj[j]);
+                }
             }
         }
-    }
-    [[unroll]] for (uint j = 0; j < 8; ++j) {
-        if (j < n_logits) {
-            store_sum(j + 1, proj[j]);
+        barrier();
+
+        if (ROUTE_STAGE == 1) {
+            const uint row = gl_WorkGroupID.x % n_logits;
+            const float value = sum_partials(row + 1) + data_b[b_offset + row];
+            if (gl_SubgroupID == 0 && subgroupElect()) {
+                data_d[dst + embd + row] = value;
+            }
+            return;
         }
     }
-    barrier();
 
-    const float pa = sigmoid(sum_partials(1) + data_b[b_offset]);
-    const float pb = sigmoid(sum_partials(2) + data_b[b_offset + 1]);
+    const float pa = sigmoid(logit(0, dst, embd));
+    const float pb = sigmoid(logit(1, dst, embd));
     float branch_sum = 0.0;
-    for (uint i = tid*width; i < n_embd; i += BLOCK_SIZE*width) {
+    [[unroll]] for (uint i = tid*width; tid < reduction_size && i < embd; i += reduction_size*width) {
         const vec4 value = pre_scale*(pa*load_x(a + i, packed) + pb*load_x(b + i, packed));
         branch_sum += dot(value, value);
     }
     store_sum(9, branch_sum);
     barrier();
 
-    const float branch_rms = inversesqrt(sum_partials(9)/float(n_embd) + norm_eps);
-    for (uint i = tid*width; i < n_embd; i += BLOCK_SIZE*width) {
+    if (ROUTE_STAGE == 2 && gl_SubgroupID == 128/gl_SubgroupSize && subgroupElect()) {
+        const vec4 mix = n_logits == 8 ? sinkhorn_2(vec4(logit(4, dst, embd), logit(5, dst, embd), logit(6, dst, embd), logit(7, dst, embd))) : vec4(1, 0, 0, 1);
+        store_tail(dst, embd, 2.0*sigmoid(logit(2, dst, embd)), 2.0*sigmoid(logit(3, dst, embd)), mix);
+    }
+
+    const float branch_rms = inversesqrt(sum_partials(9)/float(embd) + norm_eps);
+    [[unroll]] for (uint i = tid*width; tid < reduction_size && i < embd; i += reduction_size*width) {
         const vec4 value = pre_scale*(pa*load_x(a + i, packed) + pb*load_x(b + i, packed));
         if (packed) {
             data_d4[(dst + i)/4] = (value*branch_rms)*data_n4[(n_offset + i)/4];
@@ -155,24 +211,17 @@ void main() {
         }
     }
 
-    if (gl_SubgroupID == 0) {
+    if (ROUTE_STAGE != 2 && gl_SubgroupID == 0) {
+        const bool output_lane = subgroupElect();
         float logits[8];
         [[unroll]] for (uint j = 2; j < 8; ++j) {
             if (j < n_logits) {
-                logits[j] = sum_partials(j + 1) + data_b[b_offset + j];
+                logits[j] = logit(j, dst, embd);
             }
         }
-        if (subgroupElect()) {
-            const uint tail = dst + n_embd;
+        if (output_lane) {
             const vec4 mix = n_logits == 8 ? sinkhorn_2(vec4(logits[4], logits[5], logits[6], logits[7])) : vec4(1, 0, 0, 1);
-            data_d[tail    ] = 2.0*sigmoid(logits[2]);
-            data_d[tail + 1] = 2.0*sigmoid(logits[3]);
-            data_d[tail + 2] = mix.x;
-            data_d[tail + 3] = mix.y;
-            data_d[tail + 4] = mix.z;
-            data_d[tail + 5] = mix.w;
-            data_d[tail + 6] = 0.0;
-            data_d[tail + 7] = 0.0;
+            store_tail(dst, embd, 2.0*sigmoid(logits[2]), 2.0*sigmoid(logits[3]), mix);
         }
     }
 }

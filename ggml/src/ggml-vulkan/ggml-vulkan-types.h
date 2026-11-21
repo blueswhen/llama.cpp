@@ -576,6 +576,8 @@ static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
     { 6, 0, 5 }, // top_k->src[0]   == add
 };
 
+static constexpr std::initializer_list<ggml_op> rms_norm_scale_pattern { GGML_OP_RMS_NORM, GGML_OP_SCALE };
+
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_mul_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL };
 
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_pattern     { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
@@ -666,6 +668,7 @@ enum topk_moe_mode {
 };
 
 enum rms_norm_mode {
+    RMS_NORM_SCALE,
     RMS_NORM_MUL,
     RMS_NORM_MUL_ADD,
     RMS_NORM_MUL_ADD_MUL,
@@ -779,6 +782,7 @@ struct vk_device_struct {
     bool subgroup_size_control;
     uint32_t subgroup_min_size;
     uint32_t subgroup_max_size;
+    uint32_t subgroup_max_workgroup_subgroups;
     bool subgroup_require_full_support;
 
     // floor(log2(maxComputeWorkGroupInvocations))
@@ -924,6 +928,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_group_norm_f32;
     // [src/dst 0=fp32,1=bf16][mul]
     std::array<vk_pipeline, 3> pipeline_rms_norm[2][2];
+    std::array<vk_pipeline, 3> pipeline_rms_norm_scale;
     // [src/dst 0=fp32,1=bf16][residual 0=fp32,1=bf16][post mul]
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_add[2][2][2];
     vk_pipeline pipeline_rms_norm_mul_add_partials_f32;
@@ -993,6 +998,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
     vk_pipeline pipeline_hc_route_2_f32;
+    vk_pipeline pipeline_hc_route_2_decode_f32;
+    vk_pipeline pipeline_hc_route_2_project_f32;
+    vk_pipeline pipeline_hc_route_2_finish_f32;
     vk_pipeline pipeline_hc_post_2_f32;
     vk_pipeline pipeline_hc_post_2_nocomb_f32;
     vk_pipeline pipeline_top_k_mask_f16;
