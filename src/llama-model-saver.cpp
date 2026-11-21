@@ -362,8 +362,8 @@ void llama_model_saver::add_kv_from_model() {
         add_kv(LLM_KV_HYPER_CONNECTION_FIXED_IDENTITY, hparams.mhc_fixed_identity);
     }
 
-    add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               hparams.loop_count > 0 ? hparams.mhc_streams : hparams.dsv4_hc_mult);
-    add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.loop_count > 0 ? hparams.mhc_iterations : hparams.dsv4_hc_sinkhorn_iters);
+    add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               hparams.dsv4_hc_mult);
+    add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
     add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
     add_kv(LLM_KV_HYPER_CONNECTION_MAGNITUDE,           hparams.hc_magnitude);
     add_kv(LLM_KV_HASH_LAYER_COUNT,                     hparams.dsv4_hash_layer_count);

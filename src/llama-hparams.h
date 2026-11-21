@@ -367,8 +367,6 @@ struct llama_hparams {
     uint32_t loop_count         = 0;
     uint32_t mhc_start          = 0;
     uint32_t mhc_end            = 0;
-    uint32_t mhc_streams        = 0;
-    uint32_t mhc_iterations     = 0;
     float    mhc_pre_scale      = 1.0f;
     bool     mhc_fixed_identity = false;
 

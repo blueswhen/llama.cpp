@@ -1159,15 +1159,6 @@ class GGUFWriter:
     def add_engram_token_map(self, values: Sequence[int]) -> None:
         self.add_key_value(Keys.Engram.TOKEN_MAP.format(arch=self.arch), list(values), GGUFValueType.ARRAY, GGUFValueType.INT32)
 
-    def add_loop_start(self, value: int) -> None:
-        self.add_uint32(Keys.Loop.START.format(arch=self.arch), value)
-
-    def add_loop_end(self, value: int) -> None:
-        self.add_uint32(Keys.Loop.END.format(arch=self.arch), value)
-
-    def add_loop_count(self, value: int) -> None:
-        self.add_uint32(Keys.Loop.COUNT.format(arch=self.arch), value)
-
     def add_hyper_connection_start(self, value: int) -> None:
         self.add_uint32(Keys.HyperConnection.START.format(arch=self.arch), value)
 

@@ -368,14 +368,10 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_LOG_SCALE_FLOOR,              "%s.attention.log_scale_floor"              },
     { LLM_KV_ATTENTION_LOG_SCALE_ALPHA,              "%s.attention.log_scale_alpha"              },
 
-    { LLM_KV_LOOP_START,                             "%s.loop.start"                             },
-    { LLM_KV_LOOP_END,                               "%s.loop.end"                               },
-    { LLM_KV_LOOP_COUNT,                             "%s.loop.count"                             },
-    { LLM_KV_HYPER_CONNECTION_START,                              "%s.hyper_connection.start"                              },
-    { LLM_KV_HYPER_CONNECTION_END,                                "%s.hyper_connection.end"                                },
-    { LLM_KV_HYPER_CONNECTION_PRE_SCALE,                          "%s.hyper_connection.pre_scale"                          },
-    { LLM_KV_HYPER_CONNECTION_FIXED_IDENTITY,                     "%s.hyper_connection.fixed_identity"                     },
-
+    { LLM_KV_HYPER_CONNECTION_START,                 "%s.hyper_connection.start"                 },
+    { LLM_KV_HYPER_CONNECTION_END,                   "%s.hyper_connection.end"                   },
+    { LLM_KV_HYPER_CONNECTION_PRE_SCALE,             "%s.hyper_connection.pre_scale"             },
+    { LLM_KV_HYPER_CONNECTION_FIXED_IDENTITY,        "%s.hyper_connection.fixed_identity"        },
     { LLM_KV_HYPER_CONNECTION_COUNT,                 "%s.hyper_connection.count"                 },
     { LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,   "%s.hyper_connection.sinkhorn_iterations"   },
     { LLM_KV_HYPER_CONNECTION_EPSILON,               "%s.hyper_connection.epsilon"               },

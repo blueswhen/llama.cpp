@@ -9,20 +9,23 @@ void llama_model_sensenova_loop::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_LOOP_START, hparams.loop_start);
     ml.get_key(LLM_KV_LOOP_END,   hparams.loop_end);
     ml.get_key(LLM_KV_LOOP_COUNT, hparams.loop_count);
-    if (gguf_find_key(ml.metadata, ml.llm_kv(LLM_KV_HYPER_CONNECTION_START).c_str()) >= 0) {
-        ml.get_key(LLM_KV_HYPER_CONNECTION_START,               hparams.mhc_start);
-        ml.get_key(LLM_KV_HYPER_CONNECTION_END,                 hparams.mhc_end);
-        ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,               hparams.mhc_streams);
-        ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.mhc_iterations);
-        ml.get_key(LLM_KV_HYPER_CONNECTION_PRE_SCALE,           hparams.mhc_pre_scale);
-        ml.get_key(LLM_KV_HYPER_CONNECTION_FIXED_IDENTITY,      hparams.mhc_fixed_identity);
-    } else {
-        ml.get_key(ml.arch_name + ".mhc.start",          hparams.mhc_start);
-        ml.get_key(ml.arch_name + ".mhc.end",            hparams.mhc_end);
-        ml.get_key(ml.arch_name + ".mhc.streams",        hparams.mhc_streams);
-        ml.get_key(ml.arch_name + ".mhc.iterations",     hparams.mhc_iterations);
-        ml.get_key(ml.arch_name + ".mhc.pre_scale",      hparams.mhc_pre_scale);
-        ml.get_key(ml.arch_name + ".mhc.fixed_identity", hparams.mhc_fixed_identity);
+    if (!ml.get_key(ml.arch_name + ".mhc.start", hparams.mhc_start, false)) {
+        ml.get_key(LLM_KV_HYPER_CONNECTION_START, hparams.mhc_start);
+    }
+    if (!ml.get_key(ml.arch_name + ".mhc.end", hparams.mhc_end, false)) {
+        ml.get_key(LLM_KV_HYPER_CONNECTION_END, hparams.mhc_end);
+    }
+    if (!ml.get_key(ml.arch_name + ".mhc.streams", hparams.dsv4_hc_mult, false)) {
+        ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.dsv4_hc_mult);
+    }
+    if (!ml.get_key(ml.arch_name + ".mhc.iterations", hparams.dsv4_hc_sinkhorn_iters, false)) {
+        ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
+    }
+    if (!ml.get_key(ml.arch_name + ".mhc.pre_scale", hparams.mhc_pre_scale, false)) {
+        ml.get_key(LLM_KV_HYPER_CONNECTION_PRE_SCALE, hparams.mhc_pre_scale);
+    }
+    if (!ml.get_key(ml.arch_name + ".mhc.fixed_identity", hparams.mhc_fixed_identity, false)) {
+        ml.get_key(LLM_KV_HYPER_CONNECTION_FIXED_IDENTITY, hparams.mhc_fixed_identity);
     }
 
     const uint32_t n_layer = hparams.n_layer();
@@ -37,8 +40,8 @@ void llama_model_sensenova_loop::load_arch_hparams(llama_model_loader & ml) {
     if (hparams.n_layer_nextn && hparams.is_recr(n_layer)) {
         throw std::runtime_error("SenseNova Loop MTP requires a full-attention layer");
     }
-    if (hparams.mhc_start >= hparams.mhc_end || hparams.mhc_end > n_physical || hparams.mhc_streams != 2 ||
-            hparams.mhc_iterations == 0 || hparams.mhc_iterations > 20 || !std::isfinite(hparams.mhc_pre_scale) || hparams.mhc_pre_scale <= 0.0f) {
+    if (hparams.mhc_start >= hparams.mhc_end || hparams.mhc_end > n_physical || hparams.dsv4_hc_mult != 2 ||
+            hparams.dsv4_hc_sinkhorn_iters == 0 || hparams.dsv4_hc_sinkhorn_iters > 20 || !std::isfinite(hparams.mhc_pre_scale) || hparams.mhc_pre_scale <= 0.0f) {
         throw std::runtime_error("unsupported SenseNova mHC configuration");
     }
     if (!((hparams.mhc_end <= hparams.loop_start) ||
@@ -119,7 +122,6 @@ llama_model_sensenova_loop::graph::routing llama_model_sensenova_loop::graph::bu
     ggml_tensor * logits = build_lora_mm(weight, flat);
     if (logits->op == GGML_OP_MUL_MAT) {
         ggml_prec_set_acc(logits, GGML_PREC_F32);
-        ggml_prec_set_src(logits, GGML_PREC_F32, 1);
     }
     logits = ggml_add(ctx0, logits, bias);
     auto row = [&](int i) {
@@ -139,7 +141,7 @@ llama_model_sensenova_loop::graph::routing llama_model_sensenova_loop::graph::bu
         for (int i = 0; i < 4; ++i) {
             mix[i] = row(4 + i);
         }
-        build_sinkhorn(ctx0, mix, hparams.mhc_iterations);
+        build_sinkhorn(ctx0, mix, hparams.dsv4_hc_sinkhorn_iters);
         result.mix = ggml_concat(ctx0, ggml_concat(ctx0, mix[0], mix[1], 0), ggml_concat(ctx0, mix[2], mix[3], 0), 0);
     }
     cb(result.input, "mhc_input", il);

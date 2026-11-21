@@ -2902,7 +2902,7 @@ uint32_t llama_context::graph_max_nodes() const {
         if (model.hparams.mhc_start >= model.hparams.loop_start && model.hparams.mhc_end <= model.hparams.loop_end) {
             n_mhc *= model.hparams.loop_count;
         }
-        res = std::max<uint32_t>(res, 64u * model.n_tensors() + 128u * model.hparams.n_layer() + 48u * model.hparams.mhc_iterations * n_mhc);
+        res = std::max<uint32_t>(res, 64u * model.n_tensors() + 128u * model.hparams.n_layer() + 48u * model.hparams.dsv4_hc_sinkhorn_iters * n_mhc);
     }
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();

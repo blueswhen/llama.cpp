@@ -256,11 +256,6 @@ class Keys:
             CANDIDATE_TOP_K_BLOCKS = "{arch}.attention.indexer.candidate_top_k_blocks"
             CANDIDATE_BLOCK_SIZE   = "{arch}.attention.indexer.candidate_block_size"
 
-    class Loop:
-        START = "{arch}.loop.start"
-        END   = "{arch}.loop.end"
-        COUNT = "{arch}.loop.count"
-
     class HyperConnection:
         START                = "{arch}.hyper_connection.start"
         END                  = "{arch}.hyper_connection.end"

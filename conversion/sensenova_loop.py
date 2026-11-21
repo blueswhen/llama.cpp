@@ -53,11 +53,6 @@ class SenseNovaLoopModel(Qwen3_5TextModel):
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
         self.hparams = {**hp, "num_hidden_layers": len(self.plan), "layer_types": [layer_types[p] for p in self.plan]}
 
-    def prepare_tensors(self):
-        if not self.no_mtp and not any(name.startswith(f"model.layers.{len(self.first_visit)}.") for name in self.model_tensors):
-            raise ValueError("MTP weights are missing from the checkpoint index; include them in model.safetensors.index.json or use --no-mtp")
-        super().prepare_tensors()
-
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
 
