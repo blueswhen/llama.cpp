@@ -173,6 +173,10 @@ llama_kv_cache::llama_kv_cache(
             continue;
         }
 
+        if (reuse && reuse(il) >= 0) {
+            continue;
+        }
+
         if (share && other) {
             const int32_t il_share = share(il);
 

@@ -73,6 +73,14 @@ uint32_t llama_model_sensenova_loop::physical_layer(uint32_t il) const {
     return il - extra;
 }
 
+int32_t llama_model_sensenova_loop::kv_cache_layer_reuse(int32_t il) const {
+    if (il < 0 || uint32_t(il) >= hparams.n_layer() || hparams.is_recr(il)) {
+        return -1;
+    }
+    const uint32_t source = layer_tensor_sources[il];
+    return source == uint32_t(il) ? -1 : int32_t(source);
+}
+
 void llama_model_sensenova_loop::load_arch_tensors(llama_model_loader & ml) {
     // Per-tensor scales are loaded after the shared layer aliases.
     for (const auto & item : ml.weights_map) {

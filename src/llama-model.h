@@ -1064,6 +1064,8 @@ struct llama_model {
 
     llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
 
+    virtual int32_t kv_cache_layer_reuse(int32_t) const { return -1; }
+
     // graph size budget: max graph nodes per model tensor
     virtual uint32_t graph_nodes_per_tensor() const { return 8; }
 
