@@ -358,12 +358,15 @@ struct server_slot {
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
+        std::vector<uint8_t> data_spec;
+        common_speculative_get_state(spec, id, data_spec);
+
+        const size_t cur_size = cur_size_tgt + cur_size_dft + data_spec.size();
 
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, data_spec);
         if (cur == nullptr) {
             return false;
         }
@@ -382,9 +385,13 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::vector<common_adapter_lora_info> & lora_new) {
-        bool res = prompt_cache.load(prompt, tokens, lora_new, ctx_tgt, ctx_dft, id);
+        std::vector<uint8_t> data_spec;
+        common_speculative_get_state(spec, id, data_spec);
+        bool res = prompt_cache.load(prompt, tokens, lora_new, ctx_tgt, ctx_dft, id, &data_spec);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+        } else {
+            common_speculative_set_state(spec, id, data_spec);
         }
 
         return res;
@@ -394,6 +401,7 @@ struct server_slot {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
+        common_speculative_set_state(spec, id, {});
 
         prompt.clear();
     }
@@ -865,6 +873,11 @@ struct server_slot {
         mem.seq_rm(other.id,     -1, -1);
         mem.seq_cp(id, other.id, -1, -1);
 
+        std::vector<uint8_t> data_spec;
+        if (common_speculative_get_state(spec, id, data_spec)) {
+            common_speculative_set_state(other.spec, other.id, data_spec);
+        }
+
         other.prompt = prompt.clone();
     }
 
@@ -873,6 +886,11 @@ struct server_slot {
 
         mem.seq_rm(other.id,     -1, -1);
         mem.seq_cp(id, other.id, -1, -1);
+
+        std::vector<uint8_t> data_spec;
+        if (common_speculative_get_state(spec, id, data_spec)) {
+            common_speculative_set_state(other.spec, other.id, data_spec);
+        }
 
         other.i_batch = i_batch;
 
@@ -2909,6 +2927,7 @@ private:
     // returns the number of bytes consumed, 0 if there is no usable draft state
     // the draft starts empty unless the file holds a draft state that fits the draft context
     size_t load_slot_draft(const std::string & filepath, size_t offset, server_slot & slot) const {
+        common_speculative_set_state(spec.get(), slot.id, {});
         if (ctx_dft != nullptr) {
             llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
         }
@@ -2942,9 +2961,7 @@ private:
                 return n_read;
             }
         }
-        if (!data_spec.empty()) {
-            common_speculative_set_state(spec.get(), slot.id, data_spec);
-        }
+        common_speculative_set_state(spec.get(), slot.id, data_spec);
         SLT_INF(slot, "restored the draft state (%.3f MiB) from '%s'\n", (float) n_read / 1024 / 1024, filepath.c_str());
         return n_read;
     }
@@ -3291,6 +3308,12 @@ private:
                     // nread is the end offset of the llama state payload within the file
                     const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
                     const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, *slot);
+
+                    std::vector<uint8_t> data_spec;
+                    if (!slot->prompt.tokens.empty() && common_speculative_get_state(spec.get(), slot->id, data_spec) && data_spec.empty()) {
+                        SLT_WRN(*slot, "%s", "slot file has no speculative state, discarding the cached prefix\n");
+                        slot->prompt_clear();
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -3851,6 +3874,10 @@ private:
                                 llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
 
+                        if (!common_speculative_get_state(spec.get(), slot.id, slot.spec_ckpt.data_spec)) {
+                            slot.spec_ckpt.data_spec.clear();
+                        }
+
                         if (use_ckpt_dft) {
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
@@ -4216,9 +4243,13 @@ private:
 
                                 if (reuse.ckpt) {
                                     const auto & cur = *reuse.ckpt;
+                                    std::vector<uint8_t> data_spec;
 
                                     // restore the context checkpoint
-                                    if (!cur.load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+                                    if (cur.data_spec.empty() && common_speculative_get_state(spec.get(), slot.id, data_spec)) {
+                                        SLT_WRN(slot, "%s", "context checkpoint has no speculative state, reprocessing the prompt\n");
+                                        reuse = {};
+                                    } else if (!cur.load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
                                         !cur.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
                                         if (cur.id_task != -1) {
                                             GGML_ABORT("failed to restore context checkpoint\n");
@@ -4229,8 +4260,12 @@ private:
                                     } else {
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, cur.data_spec);
-
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, reuse.n_past, (float) cur.size() / 1024 / 1024);
+                                        if (common_speculative_get_state(spec.get(), slot.id, data_spec) && data_spec.empty()) {
+                                            SLT_WRN(slot, "%s", "context checkpoint has incompatible speculative state, reprocessing the prompt\n");
+                                            reuse = {};
+                                        } else {
+                                            SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, reuse.n_past, (float) cur.size() / 1024 / 1024);
+                                        }
                                     }
                                 }
 
@@ -4300,6 +4335,9 @@ private:
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
                     slot.mem.seq_rm(slot.id, p0, -1);
+                    if (slot.prompt.tokens.empty()) {
+                        common_speculative_set_state(spec.get(), slot.id, {});
+                    }
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;
@@ -4939,6 +4977,8 @@ private:
                         if (slot.ctx_dft) {
                             GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                         }
+
+                        common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 

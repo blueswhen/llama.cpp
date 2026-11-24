@@ -335,6 +335,25 @@ static void test_json_helpers(testing & t) {
 // server_prompt
 //
 
+static void test_prompt_cache_speculative_state(testing & t) {
+    server_prompt prompt;
+    prompt.tokens = server_tokens(llama_tokens{1, 2, 3}, false);
+    const std::vector<uint8_t> data_spec = {4, 5, 6, 7};
+
+    server_prompt_cache cache(1, 0);
+    auto * state = cache.alloc(prompt, 100, 200, data_spec);
+    t.assert_true("allocates state", state != nullptr);
+    if (state != nullptr) {
+        t.assert_true("preserves speculative state", state->data.spec == data_spec);
+        t.assert_equal("counts speculative bytes", (size_t) 304, cache.size());
+    }
+
+    server_prompt_cache limited(1, 0);
+    limited.limit_size = 303;
+    t.assert_true("speculative bytes count toward limit", limited.alloc(prompt, 100, 200, data_spec) == nullptr);
+    t.assert_equal("rejected entry leaves cache empty", (size_t) 0, limited.size());
+}
+
 static void test_server_prompt_reuse(testing & t) {
     // 110 text tokens, the position of a token is its index
     auto make_prompt = [](std::vector<std::array<llama_pos, 2>> checkpoints) {
@@ -954,6 +973,7 @@ int main(int argc, char ** argv) {
     t.test("json_helpers",  test_json_helpers);
     t.test("lora_helpers",  test_lora_helpers);
     t.test("server_prompt_reuse", test_server_prompt_reuse);
+    t.test("prompt_cache_speculative_state", test_prompt_cache_speculative_state);
     t.test("server_pipe",   test_server_pipe);
     t.test("decision_escape", test_decision_escape);
     t.test("rerank_template", test_rerank_template);
