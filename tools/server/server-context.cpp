@@ -68,41 +68,14 @@ static common_speculative_output_limits server_output_limits(const common_params
     return result;
 }
 
-// a checkpoint restore dropped tokens the target had accepted - re-accept them rather than verify again
-static std::vector<llama_token> server_accept_replay(
-        common_sampler * smpl,
-        llama_context * ctx,
-        const std::vector<int32_t> & idxs,
-        const llama_tokens & draft) {
-    GGML_ASSERT(idxs.size() == draft.size() + 1);
-
-    std::vector<llama_token> result;
-    result.reserve(idxs.size());
-
-    for (size_t i = 0; i < draft.size(); ++i) {
-        // the token is discarded - the call is what advances the sampler over this position
-        common_sampler_sample(smpl, ctx, idxs[i]);
-        common_sampler_accept(smpl, draft[i], true);
-        result.push_back(draft[i]);
-    }
-
-    const llama_token id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
-    common_sampler_accept(smpl, id, true);
-    result.push_back(id);
-
-    return result;
-}
-
 // synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
-// on replay the draft was already accepted before a context checkpoint restore, so repeat the same decisions
 static std::vector<llama_token> server_sample_and_accept_synth(
         common_sampler * smpl,
         llama_context * ctx,
         const std::vector<int32_t> & idxs,
         const llama_tokens & draft,
         const std::vector<double> & synth_probs,
-        std::mt19937 & rng,
-        bool is_replay) {
+        std::mt19937 & rng) {
     GGML_ASSERT(idxs.size() == draft.size() + 1);
     GGML_ASSERT(synth_probs.size() >= draft.size());
 
@@ -113,14 +86,11 @@ static std::vector<llama_token> server_sample_and_accept_synth(
     std::uniform_real_distribution<double> dist(0.0, 1.0);
     for (size_t i = 0; i < draft.size(); ++i) {
         const llama_token id = common_sampler_sample(smpl, ctx, idxs[i]);
-        const bool accept = is_replay || dist(rng) < synth_probs[i];
+        const bool accept = dist(rng) < synth_probs[i];
         // do not accept a drafted EOG token - it would end the generation early
-        // on replay the last token is from the target and can be EOG, so skip this check
-        if (accept && (is_replay || !llama_vocab_is_eog(vocab, draft[i]))) {
+        if (accept && !llama_vocab_is_eog(vocab, draft[i])) {
             // synthetic draft tokens do not advance grammar or reasoning state
-            // the last replay token is from the target and must advance both
-            const bool is_replay_target = is_replay && i + 1 == draft.size();
-            common_sampler_accept(smpl, draft[i], is_replay_target);
+            common_sampler_accept(smpl, draft[i], false);
             result.push_back(draft[i]);
             continue;
         }
@@ -307,7 +277,7 @@ struct server_slot {
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
-    bool spec_is_replay = false;
+    bool spec_is_replay = false; // the last token in spec_draft is the verified correction
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
@@ -620,11 +590,17 @@ struct server_slot {
         return n_draft_max;
     }
 
+    size_t n_spec_draft_inputs() const {
+        GGML_ASSERT(!spec_is_replay || !spec_draft.empty());
+        return spec_draft.size() - (spec_is_replay ? 1 : 0);
+    }
+
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
     void handle_last_sampled_token(server_batch & batch) {
         bool add_ok = true;
         // the audio stream has no token before the first step, track the position with a dummy token
         const llama_token tok_track = sampled == LLAMA_TOKEN_NULL ? 0 : sampled;
+        const size_t n_draft = n_spec_draft_inputs();
         if (spec_draft.empty()) {
             // no speculative decoding
             i_batch = batch.size();
@@ -653,27 +629,31 @@ struct server_slot {
                     sampled, n_ctx, prompt.n_tokens(), truncated);
         } else {
             SLT_DBG(*this, "generate_draft: id=%d, #tokens=%zu, #draft=%zu, pos_next=%d\n",
-                    sampled, prompt.tokens.size(), spec_draft.size(), prompt.tokens.pos_next());
+                    sampled, prompt.tokens.size(), n_draft, prompt.tokens.pos_next());
 
             GGML_ASSERT(spec_i_batch.empty());
 
             spec_i_batch.push_back(batch.size());
-            for (size_t i = 0; i < spec_draft.size(); i++) {
+            for (size_t i = 0; i < n_draft; i++) {
                 spec_i_batch.push_back(batch.size() + i + 1);
             }
 
             auto pos0 = prompt.tokens.pos_next();
 
             add_ok &= batch.add(id, sampled, pos0++, true, false);
-            for (auto token : spec_draft) {
-                add_ok &= batch.add(this->id, token, pos0++, true, false);
+            for (size_t i = 0; i < n_draft; ++i) {
+                add_ok &= batch.add(id, spec_draft[i], pos0++, true, false);
             }
         }
 
         GGML_ASSERT(add_ok && "batch must be large enough to hold the sampled and draft tokens");
 
         prompt.tokens.push_back(tok_track);
-        prompt.tokens.insert(spec_draft);
+        if (spec_is_replay) {
+            prompt.tokens.insert({spec_draft.begin(), spec_draft.begin() + n_draft});
+        } else {
+            prompt.tokens.insert(spec_draft);
+        }
     }
 
     void release() {
@@ -4916,18 +4896,24 @@ private:
             }
 
             // save the original draft size
-            const size_t n_draft = slot.spec_draft.size();
+            const bool replay = slot.spec_is_replay;
+            const size_t n_draft = slot.n_spec_draft_inputs();
 
-            GGML_ASSERT(n_draft > 0);
+            GGML_ASSERT(replay || n_draft > 0);
 
             // batch indices of the draft tokens, used to get the token probabilities below
             auto spec_i_batch = std::move(slot.spec_i_batch);
 
-            // verify and try to accept the draft
-            {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+            GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
 
-                GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
+            // The previous verification already advanced the sampler and chose the correction.
+            if (replay) {
+                if (trace > 0) {
+                    SLT_INF(slot, "accepted %2zu/%2zu draft tokens (replay, reuse correction)\n", n_draft, n_draft);
+                }
+                common_speculative_accept(spec.get(), slot.id, n_draft);
+            } else {
+
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
 
@@ -4939,9 +4925,7 @@ private:
                     // synthetic acceptance replaces verification entirely, so it comes first
                     accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft,
-                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
-                } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
-                    accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
+                            synth_probs, slot.spec_synth_rng);
                 } else if (use_rejection) {
                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
                 } else {
@@ -4949,7 +4933,6 @@ private:
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
-
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
                 // the recurrent snapshots are only guaranteed for batches of up to n_rs_seq + 1 tokens, so a longer draft uses its checkpoint
@@ -4964,7 +4947,7 @@ private:
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
 
-                        // partial acceptance is not supported by the context -> truncate the draft and restore the state
+                        // Restore the context, then rebuild it through the last accepted draft token.
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
 
@@ -4983,8 +4966,6 @@ private:
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
-                        common_sampler_copy(smpl_save.get(), slot.smpl.get());
-
                         return;
                     }
                 }
@@ -5000,10 +4981,7 @@ private:
 
             const auto ids = std::move(slot.spec_draft);
 
-            size_t n_accepted = ids.size() - 1;
-            if (slot.spec_is_replay && n_accepted > 0) {
-                n_accepted--;
-            }
+            const size_t n_accepted = ids.size() - 1;
             slot.spec_is_replay = false;
 
             slot.stats.update_gen_last();

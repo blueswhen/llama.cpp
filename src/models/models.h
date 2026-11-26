@@ -2859,6 +2859,8 @@ struct llama_model_sensenova_loop : public llama_model_qwen35 {
     uint32_t physical_layer(uint32_t il) const;
     int32_t kv_cache_layer_reuse(int32_t il) const override;
 
+    bool reuse_loop_kv = false;
+
     struct graph : public llama_model_qwen35::graph_base {
         graph(const llm_graph_params & params);
 
