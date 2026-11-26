@@ -1,6 +1,10 @@
 #include "models.h"
 
+#include "llama-impl.h"
+
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 void llama_model_sensenova_loop::load_arch_hparams(llama_model_loader & ml) {
@@ -59,6 +63,12 @@ void llama_model_sensenova_loop::load_arch_hparams(llama_model_loader & ml) {
         }
     }
     type = n_physical == 32 ? LLM_TYPE_9B : LLM_TYPE_UNKNOWN;
+
+    const char * env = std::getenv("LLAMA_SENSENOVA_LOOP_KV_REUSE");
+    const bool reuse_requested = env && std::strcmp(env, "1") == 0;
+    reuse_loop_kv = reuse_requested && !ml.load_mtp;
+    LLAMA_LOG_INFO("%s: SenseNova Loop full-attention KV reuse = %s%s\n", __func__,
+            reuse_loop_kv ? "on" : "off", reuse_requested && ml.load_mtp ? " (MTP enabled)" : "");
 }
 
 uint32_t llama_model_sensenova_loop::physical_layer(uint32_t il) const {
@@ -74,7 +84,7 @@ uint32_t llama_model_sensenova_loop::physical_layer(uint32_t il) const {
 }
 
 int32_t llama_model_sensenova_loop::kv_cache_layer_reuse(int32_t il) const {
-    if (il < 0 || uint32_t(il) >= hparams.n_layer() || hparams.is_recr(il)) {
+    if (!reuse_loop_kv || il < 0 || uint32_t(il) >= hparams.n_layer() || hparams.is_recr(il)) {
         return -1;
     }
     const uint32_t source = layer_tensor_sources[il];
